@@ -1,6 +1,6 @@
-use objc2::rc::Id;
-use objc2_foundation::{CGPoint, CGRect, CGSize};
-use objc2_ui_kit::UIBezierPath;
+use cocoa::base::id;
+use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+use objc::{class, msg_send, rc::StrongPtr, sel, sel_impl};
 
 use crate::api_model::ImageData;
 
@@ -85,22 +85,22 @@ impl<'a> AlphaUtil<'a> {
     }
 }
 
-pub fn bezier_path_for_alpha(image_data: &ImageData) -> Id<UIBezierPath> {
+pub fn bezier_path_for_alpha(image_data: &ImageData) -> StrongPtr {
     let util = AlphaUtil { image_data };
     let rects = util.rects_for_alpha();
-    let path = unsafe { UIBezierPath::bezierPath() };
+    let path = unsafe { StrongPtr::retain(msg_send![class!(UIBezierPath), bezierPath]) };
     for rect in rects.iter() {
         let ratio = image_data.device_pixel_ratio.unwrap_or(1.0);
         let rect = CGRect::new(
-            CGPoint::new(rect.x1 as f64 / ratio, rect.y1 as f64 / ratio),
-            CGSize::new(
+            &CGPoint::new(rect.x1 as f64 / ratio, rect.y1 as f64 / ratio),
+            &CGSize::new(
                 (rect.x2 - rect.x1) as f64 / ratio,
                 (rect.y2 - rect.y1) as f64 / ratio,
             ),
         );
         unsafe {
-            let sub_path = UIBezierPath::bezierPathWithRect(rect);
-            path.appendPath(&sub_path);
+            let sub_path: id = msg_send![class!(UIBezierPath), bezierPathWithRect: rect];
+            let () = msg_send![*path, appendPath: sub_path];
         }
     }
     path

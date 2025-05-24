@@ -48,8 +48,6 @@ class MenuWidget extends StatefulWidget {
     required this.focusMode,
     required this.iconTheme,
     required this.cache,
-    required this.tapRegionGroupIds,
-    required this.parentFocusNode,
   });
 
   final DesktopMenuWidgetBuilder menuWidgetBuilder;
@@ -59,8 +57,6 @@ class MenuWidget extends StatefulWidget {
   final MenuWidgetDelegate delegate;
   final IconThemeData iconTheme;
   final DeferredMenuElementCache cache;
-  final Set<Object> tapRegionGroupIds;
-  final FocusNode? parentFocusNode;
 
   @override
   State<StatefulWidget> createState() => MenuWidgetState();
@@ -215,11 +211,10 @@ class MenuWidgetState extends State<MenuWidget>
   @override
   Widget build(BuildContext context) {
     final menuInfo = _menuInfo();
-    Widget child = FocusScope(
-      parentNode: widget.parentFocusNode,
+    final child = FocusScope(
       onKeyEvent: (_, e) {
         if (e is! KeyDownEvent && e is! KeyRepeatEvent) {
-          return KeyEventResult.handled;
+          return KeyEventResult.ignored;
         }
         if (_focusScope.hasPrimaryFocus) {
           if (e.logicalKey == LogicalKeyboardKey.arrowDown ||
@@ -266,7 +261,7 @@ class MenuWidgetState extends State<MenuWidget>
           _itemActivated(selectedEntry);
         }
 
-        return KeyEventResult.handled;
+        return KeyEventResult.ignored;
       },
       node: _focusScope,
       child: FocusTraversalGroup(
@@ -320,12 +315,6 @@ class MenuWidgetState extends State<MenuWidget>
         ),
       ),
     );
-    for (final groupId in widget.tapRegionGroupIds) {
-      child = TapRegion(
-        groupId: groupId,
-        child: child,
-      );
-    }
     return widget.menuWidgetBuilder.buildMenuContainer(
       context,
       menuInfo,
@@ -468,8 +457,6 @@ class _MenuItemWidgetState extends State<_MenuItemWidget> {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: (_) {},
       onTapUp: (_) {
         widget.delegate._itemActivated(widget.entry);
       },

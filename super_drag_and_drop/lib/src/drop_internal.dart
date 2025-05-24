@@ -6,7 +6,6 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:super_native_extensions/raw_drag_drop.dart' as raw;
-import 'package:super_native_extensions/raw_clipboard.dart' as raw;
 
 // ignore: implementation_imports, // Needed for FormatExtensions
 import 'package:super_clipboard/src/reader_internal.dart';
@@ -40,6 +39,12 @@ class _DropItem extends DropItem {
   List<PlatformFormat> get platformFormats =>
       _reader?.platformFormats ?? _item.formats;
 
+  Future<void> _maybeInitReader() async {
+    if (_reader == null && _item.readerItem != null) {
+      _reader = await DataReader.forItem(_item.readerItem!);
+    }
+  }
+
   raw.DropItem _item;
   DataReader? _reader;
 }
@@ -54,20 +59,12 @@ class _DropSession extends DropSession {
   @override
   Set<raw.DropOperation> get allowedOperations => _allowedOperations;
 
-  Future<void> updateItems(
-    List<raw.DropItem> items, {
-    required bool isDrop,
-  }) async {
+  Future<void> updateItems(List<raw.DropItem> items) async {
     final current = List<_DropItem>.from(_items);
     _items.clear();
 
-    for (final (index, item) in items.indexed) {
-      // Try same position first.
-      var existing = index < current.length ? current[index] : null;
-      if (existing != null && existing._item.itemId != item.itemId) {
-        existing = null;
-      }
-      existing ??= current
+    for (final item in items) {
+      final existing = current
           .firstWhereOrNull((element) => element._item.itemId == item.itemId);
       if (existing != null) {
         existing._item = item;
@@ -77,23 +74,8 @@ class _DropSession extends DropSession {
       }
     }
 
-    final itemsNeedingReaders = _items
-        .where((element) =>
-            element._item.readerItem != null && element._reader == null)
-        .toList(growable: false);
-
-    if (itemsNeedingReaders.isEmpty) {
-      return;
-    }
-
-    final itemInfo = await raw.DataReaderItem.getItemInfo(
-      itemsNeedingReaders.map((e) => e._item.readerItem!),
-      timeout: isDrop ? null : const Duration(milliseconds: 10),
-    );
-
-    for (final (index, info) in itemInfo.indexed) {
-      assert(itemsNeedingReaders[index]._item.readerItem == info.item);
-      itemsNeedingReaders[index]._reader = DataReader.forItemInfo(info);
+    for (final item in _items) {
+      await item._maybeInitReader();
     }
   }
 
@@ -143,9 +125,6 @@ class _DropSession extends DropSession {
     }
 
     for (final monitor in RenderDropMonitor.activeMonitors) {
-      if (!monitor.attached || !monitor.hasGeometry) {
-        continue;
-      }
       final inside = monitorsInHitTest.contains(monitor);
       final dropPosition = DropPosition.forRenderObject(position, monitor);
       monitor.onDropOver?.call(
@@ -277,10 +256,7 @@ class _DropContextDelegate extends raw.DropContextDelegate {
   Future<raw.DropOperation> onDropUpdate(raw.DropEvent event) async {
     final session =
         _sessions.putIfAbsent(event.sessionId, () => _DropSession());
-    await session.updateItems(
-      event.items,
-      isDrop: false,
-    );
+    await session.updateItems(event.items);
     return session.update(
       position: event.locationInView,
       allowedOperations: Set.from(event.allowedOperations),
@@ -297,7 +273,7 @@ class _DropContextDelegate extends raw.DropContextDelegate {
   @override
   Future<void> onPerformDrop(raw.DropEvent event) async {
     final session = _sessions[event.sessionId];
-    await session?.updateItems(event.items, isDrop: true);
+    await session?.updateItems(event.items);
     await session?.performDrop(
       location: event.locationInView,
       acceptedOperation: event.acceptedOperation!,
@@ -489,8 +465,6 @@ mixin RenderDropMonitor on RenderObject {
     this.onDropEnded = onDropEnded;
     activeMonitors.add(this);
   }
-
-  bool get hasGeometry;
 }
 
 class RenderDropMonitorBox extends RenderProxyBoxWithHitTestBehavior
@@ -509,9 +483,6 @@ class RenderDropMonitorBox extends RenderProxyBoxWithHitTestBehavior
       onDropEnded: onDropEnded,
     );
   }
-
-  @override
-  bool get hasGeometry => hasSize;
 }
 
 class RenderDropMonitorSliver extends RenderProxySliver with RenderDropMonitor {
@@ -528,7 +499,4 @@ class RenderDropMonitorSliver extends RenderProxySliver with RenderDropMonitor {
       onDropEnded: onDropEnded,
     );
   }
-
-  @override
-  bool get hasGeometry => geometry != null;
 }

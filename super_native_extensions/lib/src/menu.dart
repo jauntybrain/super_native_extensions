@@ -7,18 +7,15 @@ import 'package:flutter/widgets.dart';
 import 'menu_model.dart';
 import 'mutex.dart';
 
-import 'native/menu.dart' if (dart.library.js_interop) 'web/menu.dart';
+import 'native/menu.dart' if (dart.library.js) 'web/menu.dart';
 import 'menu_flutter.dart';
 import 'gesture/pointer_device_kind.dart';
-import 'util.dart';
 import 'widget_snapshot/widget_snapshot.dart';
 
 abstract class MobileMenuDelegate {
   void didPushSubmenu();
   void hideMenu({required bool itemSelected});
 }
-
-void Function(String)? writingToolsSuggestionCallback;
 
 typedef MobileMenuWidgetFactory = Widget Function(
   BuildContext context,
@@ -99,36 +96,17 @@ class MenuSerializationOptions {
   final double devicePixelRatio;
 }
 
-class WritingToolsConfiguration {
-  WritingToolsConfiguration({
-    required this.rect,
-    required this.text,
-  });
-
-  final Rect rect;
-  final String text;
-
-  Map<String, dynamic> serialize() {
-    return {
-      'rect': rect.serialize(),
-      'text': text,
-    };
-  }
-}
-
 class DesktopContextMenuRequest {
   DesktopContextMenuRequest({
     required this.menu,
     required this.position,
     required this.iconTheme,
     required this.fallback,
-    required this.writingToolsConfiguration,
   });
 
   final MenuHandle menu;
   final Offset position;
   final IconThemeData iconTheme;
-  final WritingToolsConfiguration? writingToolsConfiguration;
 
   // Passed to delegate when requesting Flutter desktop menu implementation.
   final Future<MenuResult> Function() fallback;

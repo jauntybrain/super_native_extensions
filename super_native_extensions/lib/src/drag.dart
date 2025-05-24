@@ -9,7 +9,7 @@ import 'image_data.dart';
 import 'mutex.dart';
 import 'gesture/pointer_device_kind.dart';
 
-import 'native/drag.dart' if (dart.library.js_interop) 'web/drag.dart';
+import 'native/drag.dart' if (dart.library.js) 'web/drag.dart';
 import 'widget_snapshot/widget_snapshot.dart';
 
 class DragConfiguration {
@@ -146,7 +146,6 @@ abstract class DragContext {
   }
 
   DragSession newSession({int? pointer});
-  void cancelSession(DragSession session);
 
   Future<void> startDrag({
     required BuildContext buildContext,

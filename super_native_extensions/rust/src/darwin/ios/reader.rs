@@ -3,37 +3,38 @@ use std::{
     fs::{self, File},
     io::Read,
     path::PathBuf,
-    ptr::NonNull,
     rc::{Rc, Weak},
     sync::{Arc, Mutex},
     thread,
 };
 
 use async_trait::async_trait;
+use block::ConcreteBlock;
+use cocoa::{
+    base::{id, nil, BOOL},
+    foundation::{NSArray, NSUInteger, NSURL},
+};
 
-use block2::RcBlock;
 use irondash_message_channel::{value_darwin::ValueObjcConversion, Value};
 use irondash_run_loop::{
     util::{Capsule, FutureCompleter},
     RunLoop,
 };
-use objc2_foundation::{
-    NSArray, NSCopying, NSData, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions,
-    NSItemProvider, NSPropertyListReadOptions, NSPropertyListSerialization, NSString, NSURL,
-};
 
-use objc2::{
-    rc::{autoreleasepool, Id},
-    runtime::{Bool, NSObject},
-    ClassType,
+use objc::{
+    class, msg_send,
+    rc::{autoreleasepool, StrongPtr},
+    sel, sel_impl,
 };
-use objc2_ui_kit::{UIDragItem, UIPasteboard};
 
 use crate::{
     error::{NativeExtensionsError, NativeExtensionsResult},
     log::OkLog,
     platform_impl::platform::{
-        common::{path_from_url, uti_conforms_to, NSURLSecurtyScopeAccess},
+        common::{
+            format_from_url, from_nsstring, nserror_description, path_from_url, to_nsstring,
+            uti_conforms_to,
+        },
         progress_bridge::bridge_progress,
     },
     reader_manager::{ReadProgress, VirtualFileReader},
@@ -46,43 +47,60 @@ pub struct PlatformDataReader {
 }
 
 enum ReaderSource {
-    Pasteboard(Id<UIPasteboard>),
-    DropSessionItems(Id<NSArray<UIDragItem>>),
+    Pasteboard(StrongPtr),
+    DropSessionItems(StrongPtr),
 }
 
 impl PlatformDataReader {
-    fn get_items_providers(&self) -> Vec<Id<NSItemProvider>> {
+    pub async fn get_format_for_file_uri(
+        file_uri: String,
+    ) -> NativeExtensionsResult<Option<String>> {
+        let res = autoreleasepool(|| unsafe {
+            let string = to_nsstring(&file_uri);
+            let url = NSURL::URLWithString_(nil, *string);
+            format_from_url(url)
+        });
+        Ok(res)
+    }
+
+    fn get_items_providers(&self) -> Vec<id> {
         match &self.source {
             ReaderSource::Pasteboard(pasteboard) => {
-                let providers = unsafe { pasteboard.itemProviders() };
-                providers.iter().map(|e| e.retain()).collect()
+                let providers: id = unsafe { msg_send![**pasteboard, itemProviders] };
+                (0..unsafe { NSArray::count(providers) })
+                    .map(|i| unsafe { NSArray::objectAtIndex(providers, i) })
+                    .collect()
             }
-            ReaderSource::DropSessionItems(items) => items
-                .iter()
-                .map(|item| unsafe { item.itemProvider() })
+            ReaderSource::DropSessionItems(items) => (0..unsafe { NSArray::count(**items) })
+                .map(|i| {
+                    let item = unsafe { NSArray::objectAtIndex(**items, i) };
+                    unsafe { msg_send![item, itemProvider] }
+                })
                 .collect(),
         }
     }
 
     pub async fn get_items(&self) -> NativeExtensionsResult<Vec<i64>> {
-        let count = {
+        let count = autoreleasepool(|| {
             let providers = self.get_items_providers();
             providers.len() as i64
-        };
+        });
         Ok((0..count).collect())
     }
 
     pub fn get_formats_for_item_sync(&self, item: i64) -> NativeExtensionsResult<Vec<String>> {
-        let formats = unsafe {
+        let formats = autoreleasepool(|| unsafe {
             let providers = self.get_items_providers();
             if item < providers.len() as i64 {
-                let provider = &providers[item as usize];
-                let identifiers = provider.registeredTypeIdentifiers();
-                identifiers.iter().map(|e| e.to_string()).collect()
+                let provider = providers[item as usize];
+                let identifiers: id = msg_send![provider, registeredTypeIdentifiers];
+                (0..NSArray::count(identifiers))
+                    .map(|i| from_nsstring(NSArray::objectAtIndex(identifiers, i)))
+                    .collect()
             } else {
                 Vec::new()
             }
-        };
+        });
         Ok(formats)
     }
 
@@ -94,35 +112,37 @@ impl PlatformDataReader {
         &self,
         item: i64,
     ) -> NativeExtensionsResult<Option<String>> {
-        let name = unsafe {
+        let name = autoreleasepool(|| unsafe {
             let providers = self.get_items_providers();
             if item < providers.len() as i64 {
-                let provider = &providers[item as usize];
-                let name = provider.suggestedName();
-                name.map(|name| name.to_string())
+                let provider = providers[item as usize];
+                let name: id = msg_send![provider, suggestedName];
+                if name.is_null() {
+                    None
+                } else {
+                    Some(from_nsstring(name))
+                }
             } else {
                 None
             }
-        };
+        });
         Ok(name)
     }
 
-    unsafe fn maybe_decode_bplist(data: &NSData) -> Id<NSObject> {
-        let data_slice = data.bytes();
+    unsafe fn maybe_decode_bplist(data: id) -> id {
+        let bytes: *const u8 = msg_send![data, bytes];
+        let length: usize = msg_send![data, length];
+        let data_slice: &[u8] = std::slice::from_raw_parts(bytes, length);
         let magic: &[u8; 8] = &[98, 112, 108, 105, 115, 116, 48, 48];
         if data_slice.starts_with(magic) {
-            let list = NSPropertyListSerialization::propertyListWithData_options_format_error(
-                data,
-                NSPropertyListReadOptions::NSPropertyListImmutable,
-                std::ptr::null_mut(),
-            );
-            if let Ok(list) = list {
-                Id::cast(list)
+            let list: id = msg_send![class!(NSPropertyListSerialization), propertyListWithData:data options:0 format:nil error:nil];
+            if list != nil {
+                list
             } else {
-                Id::cast(data.copy())
+                data
             }
         } else {
-            Id::cast(data.copy())
+            data
         }
     }
 
@@ -133,17 +153,16 @@ impl PlatformDataReader {
         read_progress: Option<Arc<ReadProgress>>,
     ) -> NativeExtensionsResult<Value> {
         let (future, completer) = FutureCompleter::new();
-        unsafe {
+        autoreleasepool(|| unsafe {
             let providers = self.get_items_providers();
             if item < providers.len() as i64 {
                 // travels between threads, must be refcounted because block is Fn
                 let completer = Arc::new(Mutex::new(Capsule::new(completer)));
-                let provider = &providers[item as usize];
+                let provider = providers[item as usize];
                 let sender = RunLoop::current().new_sender();
-                let block = RcBlock::new(move |data: *mut NSData, _err: *mut NSError| {
-                    let data = Id::retain(data);
-                    let data = data.map(|d| Self::maybe_decode_bplist(&d));
-                    let data = Movable::new(data);
+                let block = ConcreteBlock::new(move |data: id, _err: id| {
+                    let data = Self::maybe_decode_bplist(data);
+                    let data = Movable::new(StrongPtr::retain(data));
                     let completer = completer.clone();
                     sender.send(move || {
                         let completer = completer
@@ -152,39 +171,37 @@ impl PlatformDataReader {
                             .take()
                             .expect("Block invoked more than once");
                         let data = data;
-                        let data = data.take();
-                        completer.complete(Ok(Value::from_objc(data).ok_log().unwrap_or_default()))
+                        completer.complete(Ok(Value::from_objc(*data.take())
+                            .ok_log()
+                            .unwrap_or_default()))
                     });
                 });
-                let ns_progress = provider
-                    .loadDataRepresentationForTypeIdentifier_completionHandler(
-                        &NSString::from_str(&format),
-                        &block,
-                    );
-
+                let block = block.copy();
+                let ns_progress: id = msg_send![provider, loadDataRepresentationForTypeIdentifier:*to_nsstring(&format)
+                                      completionHandler:&*block];
                 if let Some(read_progress) = read_progress {
                     bridge_progress(ns_progress, read_progress);
                 }
             } else {
                 completer.complete(Ok(Value::Null));
             }
-        };
+        });
         future.await
     }
 
     pub fn new_clipboard_reader() -> NativeExtensionsResult<Rc<Self>> {
         let res = Rc::new(Self {
-            source: ReaderSource::Pasteboard(unsafe { UIPasteboard::generalPasteboard() }),
+            source: ReaderSource::Pasteboard(unsafe {
+                StrongPtr::retain(msg_send![class!(UIPasteboard), generalPasteboard])
+            }),
         });
         res.assign_weak_self(Rc::downgrade(&res));
         Ok(res)
     }
 
-    pub fn new_with_drop_session_items(
-        items: Id<NSArray<UIDragItem>>,
-    ) -> NativeExtensionsResult<Rc<Self>> {
+    pub fn new_with_drop_session_items(items: id) -> NativeExtensionsResult<Rc<Self>> {
         let res = Rc::new(Self {
-            source: ReaderSource::DropSessionItems(items),
+            source: ReaderSource::DropSessionItems(unsafe { StrongPtr::retain(items) }),
         });
         res.assign_weak_self(Rc::downgrade(&res));
         Ok(res)
@@ -220,13 +237,6 @@ impl PlatformDataReader {
         Ok(formats.iter().any(|f| f == format))
     }
 
-    pub async fn get_item_format_for_uri(
-        &self,
-        _item: i64,
-    ) -> NativeExtensionsResult<Option<String>> {
-        Ok(None)
-    }
-
     pub async fn can_read_virtual_file_for_item(
         &self,
         item: i64,
@@ -241,28 +251,26 @@ impl PlatformDataReader {
         format: &str,
         read_progress: Arc<ReadProgress>,
     ) -> NativeExtensionsResult<Option<Rc<dyn VirtualFileReader>>> {
-        let providers = self.get_items_providers();
-        if item >= providers.len() as i64 {
-            return Err(NativeExtensionsError::OtherError("Invalid item".into()));
-        }
         let (future, completer) = FutureCompleter::new();
-
-        // travels between threads, must be refcounted because block is Fn
-        let completer = Arc::new(Mutex::new(Capsule::new(completer)));
-        let provider = &providers[item as usize];
-        let sender = RunLoop::current().new_sender();
-        let block = RcBlock::new(
-            move |url: *mut NSURL, _is_in_place: Bool, error: *mut NSError| {
-                let url = unsafe { Id::retain(url) };
-                let error = unsafe { Id::retain(error) };
-                let res = match (url, error) {
-                    (Some(url), _) => FileWithBackgroundCoordinator::new(&url),
-                    (_, Some(error)) => Err(NativeExtensionsError::VirtualFileReceiveError(
-                        error.localizedDescription().to_string(),
-                    )),
-                    (_, _) => Err(NativeExtensionsError::VirtualFileReceiveError(
-                        "Unknown error".into(),
-                    )),
+        autoreleasepool(|| unsafe {
+            let providers = self.get_items_providers();
+            if item >= providers.len() as i64 {
+                completer.complete(Err(NativeExtensionsError::OtherError(
+                    "Invalid item".into(),
+                )));
+                return;
+            }
+            // travels between threads, must be refcounted because block is Fn
+            let completer = Arc::new(Mutex::new(Capsule::new(completer)));
+            let provider = providers[item as usize];
+            let sender = RunLoop::current().new_sender();
+            let block = ConcreteBlock::new(move |url: id, _is_in_place: BOOL, err: id| {
+                let res = if err != nil {
+                    Err(NativeExtensionsError::VirtualFileReceiveError(
+                        nserror_description(err),
+                    ))
+                } else {
+                    FileWithBackgroundCoordinator::new(url)
                 };
                 let completer = completer.clone();
                 sender.send(move || {
@@ -275,15 +283,13 @@ impl PlatformDataReader {
                     let res = res.map::<Option<Rc<dyn VirtualFileReader>>, _>(|f| Some(Rc::new(f)));
                     completer.complete(res);
                 });
-            },
-        );
-        let ns_progress = unsafe {
-            provider.loadInPlaceFileRepresentationForTypeIdentifier_completionHandler(
-                &NSString::from_str(format),
-                &block,
-            )
-        };
-        bridge_progress(ns_progress, read_progress);
+            });
+            let block = block.copy();
+            let ns_progress: id = msg_send![provider,
+                                    loadInPlaceFileRepresentationForTypeIdentifier:*to_nsstring(format)
+                                    completionHandler:&*block];
+            bridge_progress(ns_progress, read_progress);
+        });
         future.await
     }
 
@@ -295,21 +301,25 @@ impl PlatformDataReader {
         read_progress: Arc<ReadProgress>,
     ) -> NativeExtensionsResult<PathBuf> {
         let (future, completer) = FutureCompleter::new();
-        let providers = self.get_items_providers();
-        if item >= providers.len() as i64 {
-            return Err(NativeExtensionsError::OtherError("Invalid item".into()));
-        }
-
-        // travels between threads, must be refcounted because block is Fn
-        let completer = Arc::new(Mutex::new(Capsule::new(completer)));
-        let provider = &providers[item as usize];
-        let sender: irondash_run_loop::RunLoopSender = RunLoop::current().new_sender();
-        let block = RcBlock::new(move |url: *mut NSURL, error: *mut NSError| {
-            let url = unsafe { Id::retain(url) };
-            let error = unsafe { Id::retain(error) };
-            let res = match (url, error) {
-                (Some(url), _) => {
-                    let source_path = path_from_url(&url);
+        autoreleasepool(|| unsafe {
+            let providers = self.get_items_providers();
+            if item >= providers.len() as i64 {
+                completer.complete(Err(NativeExtensionsError::OtherError(
+                    "Invalid item".into(),
+                )));
+                return;
+            }
+            // travels between threads, must be refcounted because block is Fn
+            let completer = Arc::new(Mutex::new(Capsule::new(completer)));
+            let provider = providers[item as usize];
+            let sender = RunLoop::current().new_sender();
+            let block = ConcreteBlock::new(move |url: id, err: id| {
+                let res = if err != nil {
+                    Err(NativeExtensionsError::VirtualFileReceiveError(
+                        nserror_description(err),
+                    ))
+                } else {
+                    let source_path = path_from_url(url);
                     let source_name = source_path
                         .file_name()
                         .expect("Missing file name")
@@ -321,32 +331,23 @@ impl PlatformDataReader {
                             err.to_string(),
                         )),
                     }
-                }
-                (_, Some(error)) => Err(NativeExtensionsError::VirtualFileReceiveError(
-                    error.localizedDescription().to_string(),
-                )),
-                (_, _) => Err(NativeExtensionsError::VirtualFileReceiveError(
-                    "Unknown error".into(),
-                )),
-            };
-            let completer = completer.clone();
-            sender.send(move || {
-                let completer = completer
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("Block invoked more than once");
-                completer.complete(res);
+                };
+                let completer = completer.clone();
+                sender.send(move || {
+                    let completer = completer
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("Block invoked more than once");
+                    completer.complete(res);
+                });
             });
+            let block = block.copy();
+            let ns_progress: id = msg_send![provider,
+                                    loadFileRepresentationForTypeIdentifier:*to_nsstring(format)
+                                    completionHandler:&*block];
+            bridge_progress(ns_progress, read_progress);
         });
-        let ns_progress = unsafe {
-            provider.loadFileRepresentationForTypeIdentifier_completionHandler(
-                &NSString::from_str(format),
-                &block,
-            )
-        };
-        bridge_progress(ns_progress, read_progress);
-
         future.await
     }
 
@@ -363,17 +364,14 @@ struct FileWithBackgroundCoordinator {
 impl FileWithBackgroundCoordinator {
     /// Creates new thread where it keeps the coordinator alive while the
     /// FileWithBackgroundCoordinator is reading file.
-    fn new(url: &NSURL) -> NativeExtensionsResult<FileWithBackgroundCoordinator> {
-        let url = url.retain();
+    fn new(url: id) -> NativeExtensionsResult<FileWithBackgroundCoordinator> {
         let promise = Arc::new(Promise::new());
         let url = unsafe { Movable::new(url) };
         let promise_clone = promise.clone();
         let promise_clone2 = promise.clone();
         thread::spawn(move || {
-            let block = RcBlock::new(move |new_url: NonNull<NSURL>| {
-                let new_url = unsafe { Id::retain(new_url.as_ptr()).unwrap() };
-                let _access = NSURLSecurtyScopeAccess::new(&new_url);
-                let path = path_from_url(&new_url);
+            let block = ConcreteBlock::new(move |new_url: id| {
+                let path = path_from_url(new_url);
                 let release = Arc::new(Promise::new());
                 let file = File::open(&path);
                 match file {
@@ -391,23 +389,23 @@ impl FileWithBackgroundCoordinator {
                     }
                 }
             });
-            let mut error: Option<Id<NSError>> = None;
-            autoreleasepool(|_| unsafe {
-                url.startAccessingSecurityScopedResource();
-                let coordinator =
-                    NSFileCoordinator::initWithFilePresenter(NSFileCoordinator::alloc(), None);
-                coordinator.coordinateReadingItemAtURL_options_error_byAccessor(
-                    &url,
-                    NSFileCoordinatorReadingOptions::NSFileCoordinatorReadingWithoutChanges,
-                    Some(&mut error),
-                    &block,
-                );
-                if let Some(error) = error {
+            let block = block.copy();
+            let mut error: id = nil;
+            autoreleasepool(|| unsafe {
+                let coordinator: id = msg_send![class!(NSFileCoordinator), alloc];
+                let coordinator: id = msg_send![coordinator, initWithFilePresenter: nil];
+                let coordinator = StrongPtr::new(coordinator);
+                let () = msg_send![*coordinator,
+                    coordinateReadingItemAtURL:*url
+                    options:1 as NSUInteger /* NSFileCoordinatorReadingWithoutChanges */
+                    error: &mut error
+                    byAccessor: &*block
+                ];
+                if error != nil {
                     promise_clone.set(Err(NativeExtensionsError::VirtualFileReceiveError(
-                        error.localizedDescription().to_string(),
+                        nserror_description(error),
                     )));
                 }
-                url.stopAccessingSecurityScopedResource();
             });
         });
         promise.wait()

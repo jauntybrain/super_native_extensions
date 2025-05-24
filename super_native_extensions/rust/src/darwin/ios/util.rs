@@ -1,34 +1,26 @@
-use std::{collections::HashMap, ops::Deref, ptr::NonNull};
+use std::collections::HashMap;
 
-use block2::{Block, RcBlock};
+use block::{Block, ConcreteBlock, RcBlock};
+use cocoa::{
+    base::{id, nil, BOOL},
+    foundation::{NSArray, NSDictionary, NSInteger, NSUInteger},
+};
+use core_foundation::array::CFIndex;
+use core_graphics::{
+    base::CGFloat,
+    geometry::{CGPoint, CGRect, CGSize},
+};
 use irondash_message_channel::{value_darwin::ValueObjcConversion, Value};
-use objc2::{
-    rc::{Id, Retained},
-    runtime::{Bool, NSObject},
-    RefEncode,
-};
-use objc2_foundation::{
-    CGFloat, CGPoint, CGRect, CGSize, MainThreadMarker, NSData, NSDictionary, NSError,
-    NSItemProvider, NSItemProviderFileOptions, NSItemProviderRepresentationVisibility, NSNumber,
-    NSProgress, NSPropertyListFormat, NSPropertyListSerialization, NSString, NSURL,
-};
-use objc2_ui_kit::{CGAffineTransform, UIApplication, UIImage, UIImageOrientation, UIImageView};
+use objc::{class, msg_send, rc::StrongPtr, sel, sel_impl};
 
 use crate::{
     api_model::{ImageData, Point, Rect, Size},
     drag_manager::DragSessionId,
-    platform_impl::platform::common::cg_image_from_image_data,
+    platform_impl::platform::common::{cg_image_from_image_data, to_nsdata, to_nsstring},
     util::Movable,
     value_coerce::{CoerceToData, StringFormat},
     value_promise::ValuePromiseResult,
 };
-
-pub enum _CGImage {}
-
-unsafe impl RefEncode for _CGImage {
-    const ENCODING_REF: objc2::Encoding =
-        objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGImage", &[]));
-}
 
 impl From<CGPoint> for Point {
     fn from(p: CGPoint) -> Self {
@@ -83,193 +75,167 @@ impl From<Size> for CGSize {
     }
 }
 
-pub fn value_to_nsdata(value: &Value) -> Option<Id<NSData>> {
+pub fn value_to_nsdata(value: &Value) -> StrongPtr {
     fn is_map_or_list(value: &Value) -> bool {
         matches!(value, Value::Map(_) | Value::List(_))
     }
     if is_map_or_list(value) {
         let objc = value.to_objc();
-        if let Ok(Some(objc)) = objc {
-            let data = unsafe {
-                NSPropertyListSerialization::dataWithPropertyList_format_options_error(
-                    &objc,
-                    NSPropertyListFormat::NSPropertyListBinaryFormat_v1_0,
-                    0,
-                )
-            };
-            if let Ok(data) = data {
-                return Some(data);
+        if let Ok(objc) = objc {
+            unsafe {
+                #[allow(non_upper_case_globals)]
+                const kCFPropertyListBinaryFormat_v1_0: CFIndex = 200;
+                let data: id = msg_send![class!(NSPropertyListSerialization),
+                            dataWithPropertyList:*objc
+                            format:kCFPropertyListBinaryFormat_v1_0
+                            options:0 as NSUInteger
+                            error:nil];
+                if !data.is_null() {
+                    return StrongPtr::retain(data);
+                }
             }
         }
     }
 
     let buf = value.coerce_to_data(StringFormat::Utf8);
-    buf.map(NSData::from_vec)
+    match buf {
+        Some(data) => to_nsdata(&data),
+        None => unsafe { StrongPtr::new(std::ptr::null_mut()) },
+    }
 }
 
-pub fn value_promise_res_to_nsdata(value: &ValuePromiseResult) -> Option<Id<NSData>> {
+pub fn value_promise_res_to_nsdata(value: &ValuePromiseResult) -> StrongPtr {
     match value {
         ValuePromiseResult::Ok { value } => value_to_nsdata(value),
-        ValuePromiseResult::Cancelled => None,
+        ValuePromiseResult::Cancelled => unsafe { StrongPtr::new(std::ptr::null_mut()) },
     }
 }
 
 // NSItemProvider utility methods
 
-pub fn register_data_representation<F>(
-    item_provider: &NSItemProvider,
-    type_identifier: &str,
-    handler: F,
-) where
-    F: Fn(
-            Box<dyn Fn(Option<&NSData>, Option<&NSError>) + 'static + Send>,
-        ) -> Option<Id<NSProgress>>
-        + 'static
-        + Send,
+pub fn register_data_representation<F>(item_provider: id, type_identifier: &str, handler: F)
+where
+    F: Fn(Box<dyn Fn(id /* NSData */, id /* NSError */) + 'static + Send>) -> id + 'static + Send,
 {
-    let block = RcBlock::new(move |completion_block: NonNull<Block<dyn Fn(*mut NSData, *mut NSError)>>| -> *mut NSProgress {
-        let completion_block = unsafe { RcBlock::copy(completion_block.as_ptr()).unwrap()};
+    let handler = Box::new(handler);
+    let block = ConcreteBlock::new(move |completion_block: id| -> id {
+        let completion_block = unsafe { &mut *(completion_block as *mut Block<(id, id), ()>) };
+        let completion_block = unsafe { RcBlock::copy(completion_block) };
         let completion_block = unsafe { Movable::new(completion_block) };
-        let completion_fn = move |data: Option<&NSData>, err: Option<&NSError>| {
+        let completion_fn = move |data: id, err: id| {
             let completion_block = completion_block.clone();
-            let data = data.map(|d| d as * const _ as * mut _).unwrap_or(std::ptr::null_mut());
-            let err = err.map(|e| e as *const _ as * mut _).unwrap_or(std::ptr::null_mut());
-            completion_block.call((data, err));
+            unsafe { completion_block.call((data, err)) };
         };
-        let res = handler(Box::new(completion_fn));
-        res.map(Id::autorelease_return).unwrap_or(std::ptr::null_mut())
+        handler(Box::new(completion_fn))
     });
+    let block = block.copy();
+    let type_identifier = to_nsstring(type_identifier);
     unsafe {
-        item_provider.registerDataRepresentationForTypeIdentifier_visibility_loadHandler(
-            &NSString::from_str(type_identifier),
-            NSItemProviderRepresentationVisibility::All,
-            &block,
-        )
+        let () = msg_send![item_provider,
+            registerDataRepresentationForTypeIdentifier:*type_identifier
+            visibility: 0 as NSUInteger // all
+            loadHandler: &*block];
     }
 }
 
 pub fn register_file_representation<F>(
-    item_provider: &NSItemProvider,
+    item_provider: id,
     type_identifier: &str,
     open_in_place: bool,
     handler: F,
 ) where
     F: Fn(
-            Box<dyn Fn(Option<&NSURL>, bool /* coordinated */, Option<&NSError>) + 'static + Send>,
-        ) -> Option<Id<NSProgress>>
+            Box<dyn Fn(id /* NSURL */, bool /* coordinated */, id /* NSError */) + 'static + Send>,
+        ) -> id /* NSProgress */
         + 'static
         + Send,
 {
-    let block = RcBlock::new(move |completion_block: NonNull<Block<dyn Fn(*mut NSURL, Bool, *mut NSError)>>| -> *mut NSProgress {
-        let completion_block = unsafe { RcBlock::copy(completion_block.as_ptr()).unwrap() };
+    let handler = Box::new(handler);
+    let block = ConcreteBlock::new(move |completion_block: id| -> id {
+        let completion_block =
+            unsafe { &mut *(completion_block as *mut Block<(id, BOOL, id), ()>) };
+        let completion_block = unsafe { RcBlock::copy(completion_block) };
         let completion_block = unsafe { Movable::new(completion_block) };
-        let completion_fn = move |data: Option<&NSURL>, coordinated: bool, err: Option<&NSError>| {
+        let completion_fn = move |data: id, coordinated: bool, err: id| {
             let completion_block = completion_block.clone();
-            let data = data.map(|d| d as * const _ as * mut _).unwrap_or(std::ptr::null_mut());
-            let err = err.map(|e| e as *const _ as * mut _).unwrap_or(std::ptr::null_mut());
-            completion_block.call((data, coordinated.into(), err));
+            unsafe { completion_block.call((data, coordinated as BOOL, err)) };
         };
-        let res = handler(Box::new(completion_fn));
-        res.map(Id::autorelease_return).unwrap_or(std::ptr::null_mut())
+        handler(Box::new(completion_fn))
     });
+    let block = block.copy();
+    let type_identifier = to_nsstring(type_identifier);
     unsafe {
-        item_provider
-            .registerFileRepresentationForTypeIdentifier_fileOptions_visibility_loadHandler(
-                &NSString::from_str(type_identifier),
-                if open_in_place {
-                    NSItemProviderFileOptions::NSItemProviderFileOptionOpenInPlace
-                } else {
-                    NSItemProviderFileOptions(0)
-                },
-                NSItemProviderRepresentationVisibility::All,
-                &block,
-            )
+        let () = msg_send![item_provider,
+            registerFileRepresentationForTypeIdentifier:*type_identifier
+            fileOptions: i32::from(open_in_place) as NSInteger
+            visibility: 0 as NSUInteger // all
+            loadHandler: &*block
+        ];
     }
 }
 
 pub trait IntoObjc {
-    fn into_objc(self) -> Id<NSObject>;
+    fn into_objc(self) -> StrongPtr;
 }
 
-impl IntoObjc for HashMap<&str, Id<NSObject>> {
-    fn into_objc(mut self) -> Id<NSObject> {
-        let mut keys = Vec::<Id<NSString>>::new();
-        let mut objects = Vec::<Id<NSObject>>::new();
-        for (k, v) in self.drain() {
-            keys.push(NSString::from_str(k));
-            objects.push(v);
-        }
-        let keys = keys.iter().map(|k| k.deref()).collect::<Vec<_>>();
+impl IntoObjc for HashMap<StrongPtr, StrongPtr> {
+    fn into_objc(self) -> StrongPtr {
+        let keys: Vec<_> = self.keys().map(|k| k.clone().autorelease()).collect();
+        let objects: Vec<_> = self.values().map(|o| o.clone().autorelease()).collect();
         unsafe {
-            let res = NSDictionary::from_vec(&keys, objects);
-            Id::cast(res)
+            StrongPtr::retain(NSDictionary::dictionaryWithObjects_forKeys_(
+                nil,
+                NSArray::arrayWithObjects(nil, &objects),
+                NSArray::arrayWithObjects(nil, &keys),
+            ))
+        }
+    }
+}
+
+impl IntoObjc for HashMap<&str, StrongPtr> {
+    fn into_objc(self) -> StrongPtr {
+        let keys: Vec<_> = self.keys().map(|k| to_nsstring(k).autorelease()).collect();
+        let objects: Vec<_> = self.values().map(|o| o.clone().autorelease()).collect();
+        unsafe {
+            StrongPtr::retain(NSDictionary::dictionaryWithObjects_forKeys_(
+                nil,
+                NSArray::arrayWithObjects(nil, &objects),
+                NSArray::arrayWithObjects(nil, &keys),
+            ))
         }
     }
 }
 
 impl IntoObjc for i64 {
-    fn into_objc(self) -> Id<NSObject> {
-        unsafe {
-            let res = NSNumber::numberWithLongLong(self);
-            Id::cast(res)
-        }
+    fn into_objc(self) -> StrongPtr {
+        unsafe { StrongPtr::retain(msg_send![class!(NSNumber), numberWithLongLong: self]) }
     }
 }
 
 impl IntoObjc for DragSessionId {
-    fn into_objc(self) -> Id<NSObject> {
+    fn into_objc(self) -> StrongPtr {
         let id: i64 = self.into();
         id.into_objc()
     }
 }
 
-mod img_priv {
-    use objc2::{extern_class, extern_methods, mutability, rc::Retained, ClassType};
-    use objc2_foundation::{CGFloat, NSObject};
-    use objc2_ui_kit::UIImageOrientation;
-
-    use super::_CGImage;
-
-    extern_class!(
-        #[derive(Debug, PartialEq, Eq, Hash)]
-        pub(crate) struct UIImage;
-
-        unsafe impl ClassType for UIImage {
-            type Super = NSObject;
-            type Mutability = mutability::InteriorMutable;
-        }
-    );
-
-    extern_methods!(
-        unsafe impl UIImage {
-            #[allow(non_snake_case)]
-            #[method_id(@__retain_semantics Other imageWithCGImage:scale:orientation:)]
-            pub unsafe fn imageWithCGImage_scale_orientation(
-                cg_image: *const _CGImage,
-                scale: CGFloat,
-                orientation: UIImageOrientation,
-            ) -> Retained<UIImage>;
-        }
-    );
-}
-
-pub fn image_from_image_data(image_data: ImageData) -> Retained<UIImage> {
+pub fn image_from_image_data(image_data: ImageData) -> StrongPtr {
+    let orientation_up: NSInteger = 0; // need to flip CGImage
     let pixel_ratio = image_data.device_pixel_ratio;
     let image = cg_image_from_image_data(image_data);
-    let image = &*image as *const _ as *const _CGImage;
-    unsafe {
-        let res = img_priv::UIImage::imageWithCGImage_scale_orientation(
-            image,
-            pixel_ratio.unwrap_or(1.0),
-            UIImageOrientation::Up,
-        );
-        Retained::cast(res)
-    }
+    let image: id = unsafe {
+        msg_send![class!(UIImage),
+        imageWithCGImage: &*image
+        scale: pixel_ratio.unwrap_or(1.0) as CGFloat
+        orientation: orientation_up]
+    };
+    unsafe { StrongPtr::retain(image) }
 }
 
-pub fn image_view_from_data(image_data: ImageData, mtm: MainThreadMarker) -> Id<UIImageView> {
+pub fn image_view_from_data(image_data: ImageData) -> StrongPtr {
     let image = image_from_image_data(image_data);
-    unsafe { UIImageView::initWithImage(mtm.alloc::<UIImageView>(), Some(&image)) }
+    let image_view: id = unsafe { msg_send![class!(UIImageView), alloc] };
+    unsafe { StrongPtr::new(msg_send![image_view, initWithImage: *image]) }
 }
 
 /// Ignores the notifications event while in scope.
@@ -278,13 +244,11 @@ pub struct IgnoreInteractionEvents {}
 impl IgnoreInteractionEvents {
     pub fn new() -> Self {
         unsafe {
-            // beginIgnoringInteractionEvents is a big stick but we need one
+            // beginIgnoringInteractionEvents is a large stick but we need one
             // to prevent active drag gesture recognizer from getting events while
             // waiting for drag data.
-            let mtm = MainThreadMarker::new().unwrap();
-            let application = UIApplication::sharedApplication(mtm);
-            #[allow(deprecated)]
-            application.beginIgnoringInteractionEvents();
+            let app: id = msg_send![class!(UIApplication), sharedApplication];
+            let () = msg_send![app, beginIgnoringInteractionEvents];
         }
         Self {}
     }
@@ -293,15 +257,8 @@ impl IgnoreInteractionEvents {
 impl Drop for IgnoreInteractionEvents {
     fn drop(&mut self) {
         unsafe {
-            let mtm = MainThreadMarker::new().unwrap();
-            let application = UIApplication::sharedApplication(mtm);
-            #[allow(deprecated)]
-            application.endIgnoringInteractionEvents();
+            let app: id = msg_send![class!(UIApplication), sharedApplication];
+            let () = msg_send![app, endIgnoringInteractionEvents];
         }
     }
-}
-
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    pub fn CGAffineTransformMakeScale(sx: CGFloat, sy: CGFloat) -> CGAffineTransform;
 }

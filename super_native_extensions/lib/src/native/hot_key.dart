@@ -10,10 +10,8 @@ class HotKeyManagerImpl extends HotKeyManager {
   }
 
   Future<dynamic> _onMethodCall(MethodCall call) async {
-    if (call.method == 'onHotKeyPressed') {
-      _delegate?.onHotKeyPressed(call.arguments as int);
-    } else if (call.method == 'onHotKeyReleased') {
-      _delegate?.onHotKeyReleased(call.arguments as int);
+    if (call.method == 'onHotKey') {
+      _delegate?.onHotKey(call.arguments as int);
     }
   }
 

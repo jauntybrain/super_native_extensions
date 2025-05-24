@@ -39,19 +39,13 @@ class HotKeyDefinition {
 class HotKey {
   final int _handle;
   final HotKeyDefinition definition;
-  final VoidCallback? onPressed;
-  final VoidCallback? onReleased;
+  final VoidCallback callback;
 
   static Future<HotKey?> create({
     required HotKeyDefinition definition,
-    VoidCallback? onPressed,
-    VoidCallback? onReleased,
+    required VoidCallback callback,
   }) async {
-    return _HotKeyManager.instance.createHotKey(
-      definition,
-      onPressed,
-      onReleased,
-    );
+    return _HotKeyManager.instance.createHotKey(definition, callback);
   }
 
   Future<void> dispose() async {
@@ -63,8 +57,7 @@ class HotKey {
 
   bool _disposed = false;
 
-  HotKey._(this._handle, this.definition, this.onPressed, this.onReleased)
-      : assert(_handle != 0);
+  HotKey._(this._handle, this.definition, this.callback);
 }
 
 class _HotKeyManager extends raw.HotKeyManagerDelegate {
@@ -77,22 +70,14 @@ class _HotKeyManager extends raw.HotKeyManagerDelegate {
   static final instance = _HotKeyManager._();
 
   Future<HotKey?> createHotKey(
-    HotKeyDefinition definition,
-    VoidCallback? onPressed,
-    VoidCallback? onReleased,
-  ) async {
+      HotKeyDefinition definition, VoidCallback callback) async {
     final rawDefinition = await definition.toRaw();
     if (rawDefinition == null) {
       return null;
     }
     final handle = await raw.HotKeyManager.instance.createHotKey(rawDefinition);
     if (handle != null) {
-      final res = HotKey._(
-        handle,
-        definition,
-        onPressed,
-        onReleased,
-      );
+      final res = HotKey._(handle, definition, callback);
       _hotKeys[handle] = res;
       return res;
     } else {
@@ -106,12 +91,7 @@ class _HotKeyManager extends raw.HotKeyManagerDelegate {
   }
 
   @override
-  void onHotKeyPressed(int handle) {
-    _hotKeys[handle]?.onPressed?.call();
-  }
-
-  @override
-  void onHotKeyReleased(int handle) {
-    _hotKeys[handle]?.onReleased?.call();
+  void onHotKey(int handle) {
+    _hotKeys[handle]?.callback();
   }
 }

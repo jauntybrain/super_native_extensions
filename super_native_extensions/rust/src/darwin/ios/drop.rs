@@ -1,81 +1,74 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    iter,
+    mem::ManuallyDrop,
+    os::raw::c_void,
     rc::{Rc, Weak},
 };
 
-use block2::RcBlock;
+use block::ConcreteBlock;
+use cocoa::{
+    base::{id, nil, BOOL, NO, YES},
+    foundation::{NSArray, NSUInteger},
+};
+use core_graphics::geometry::{CGPoint, CGRect};
+
 use irondash_engine_context::EngineContext;
 use irondash_message_channel::{Late, Value};
 use irondash_run_loop::{platform::PollSession, RunLoop};
-use objc2::{
-    declare_class, msg_send_id, mutability,
-    rc::Id,
-    runtime::{NSObject, NSObjectProtocol, ProtocolObject},
-    ClassType, DeclaredClass,
+use objc::{
+    class,
+    declare::ClassDecl,
+    msg_send,
+    rc::{autoreleasepool, StrongPtr},
+    runtime::{Class, Object, Protocol, Sel},
+    sel, sel_impl,
 };
-use objc2_foundation::{CGPoint, CGRect, MainThreadMarker};
-use objc2_ui_kit::{
-    UIDragDropSession, UIDragItem, UIDragPreviewParameters, UIDragPreviewTarget, UIDropInteraction,
-    UIDropInteractionDelegate, UIDropOperation, UIDropProposal, UIDropSession,
-    UIDropSessionProgressIndicatorStyle, UITargetedDragPreview, UIView, UIViewAnimationOptions,
-};
+use once_cell::sync::Lazy;
 
 use crate::{
     api_model::{DropOperation, Size},
     drop_manager::{
-        BaseDropEvent, DropEvent, DropItem, DropItemId, DropSessionId, ItemPreview,
-        ItemPreviewRequest, PlatformDropContextDelegate, PlatformDropContextId,
+        BaseDropEvent, DropEvent, DropItem, DropSessionId, ItemPreview, ItemPreviewRequest,
+        PlatformDropContextDelegate, PlatformDropContextId,
     },
     error::{NativeExtensionsError, NativeExtensionsResult},
     log::OkLog,
+    platform_impl::platform::common::{from_nsstring, CGAffineTransformMakeScale},
     value_promise::PromiseResult,
 };
 
 use super::{
     drag_common::DropOperationExt,
-    util::{image_view_from_data, CGAffineTransformMakeScale, IgnoreInteractionEvents},
+    util::{image_view_from_data, IgnoreInteractionEvents},
     PlatformDataReader,
 };
 
 pub struct PlatformDropContext {
     id: PlatformDropContextId,
     weak_self: Late<Weak<Self>>,
-    view: Id<UIView>,
+    view: StrongPtr,
     delegate: Weak<dyn PlatformDropContextDelegate>,
-    interaction: Late<Id<UIDropInteraction>>,
-    interaction_delegate: Late<Id<SNEDropContext>>,
-    sessions: RefCell<HashMap<DropSessionId, Rc<Session>>>,
-    mtm: MainThreadMarker,
+    interaction: Late<StrongPtr>,
+    interaction_delegate: Late<StrongPtr>,
+    sessions: RefCell<HashMap<id, Rc<Session>>>,
 }
 
 struct Session {
     context_id: PlatformDropContextId,
     context_delegate: Weak<dyn PlatformDropContextDelegate>,
-    context_view: Id<UIView>,
-    platform_session: Id<ProtocolObject<dyn UIDropSession>>,
+    context_view: StrongPtr,
+    platform_session: id,
     last_operation: Cell<DropOperation>,
-    view_containers: RefCell<Vec<Id<UIView>>>,
-    mtm: MainThreadMarker,
+    view_containers: RefCell<Vec<StrongPtr>>,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         let containers = self.view_containers.borrow();
         for container in containers.iter() {
-            unsafe { container.removeFromSuperview() };
+            let () = unsafe { msg_send![**container, removeFromSuperview] };
         }
-    }
-}
-
-trait ItemId {
-    fn item_id(&self) -> DropItemId;
-}
-
-impl ItemId for UIDragItem {
-    fn item_id(&self) -> DropItemId {
-        (self as *const _ as i64).into()
     }
 }
 
@@ -86,58 +79,50 @@ impl Session {
             .ok_or_else(|| NativeExtensionsError::OtherError("missing context delegate".into()))
     }
 
-    fn session_id_(platform_session: &ProtocolObject<dyn UIDropSession>) -> DropSessionId {
-        (platform_session as *const _ as isize).into()
-    }
-
     fn session_id(&self) -> DropSessionId {
-        Self::session_id_(&self.platform_session)
+        (self.platform_session as i64).into()
     }
 
     fn create_drop_event(&self, is_perform_drop: bool) -> NativeExtensionsResult<DropEvent> {
         let delegate = self.context_delegate()?;
 
-        let location = unsafe { self.platform_session.locationInView(&self.context_view) };
-        let allows_move = unsafe { self.platform_session.allowsMoveOperation() };
-        let allowed_operations = if allows_move {
+        let session = self.platform_session;
+        let location: CGPoint = unsafe { msg_send![session, locationInView: *self.context_view] };
+        let allows_move: BOOL = unsafe { msg_send![session, allowsMoveOperation] };
+        let allowed_operations = if allows_move == YES {
             vec![DropOperation::Copy, DropOperation::Move]
         } else {
             vec![DropOperation::Copy]
         };
 
         // local data
-        let local_session = unsafe { self.platform_session.localDragSession() };
-        let local_data = local_session
-            .and_then(|session| {
-                let drag_contexts = delegate.get_platform_drag_contexts();
-                drag_contexts
-                    .iter()
-                    .map(|c| c.get_local_data(&session))
-                    .find(|c| c.is_some())
-                    .flatten()
-            })
+        let local_session: id = unsafe { msg_send![session, localDragSession] };
+        let drag_contexts = delegate.get_platform_drag_contexts();
+        let local_data = drag_contexts
+            .iter()
+            .map(|c| c.get_local_data(local_session))
+            .find(|c| c.is_some())
+            .flatten()
             .unwrap_or_default();
 
         // formats
         let mut items = Vec::new();
-        let session_items = unsafe { self.platform_session.items() };
-
-        for (item, local_data) in session_items
-            .iter()
-            .zip(local_data.into_iter().chain(iter::repeat(Value::Null)))
-        {
-            let item_provider = unsafe { item.itemProvider() };
+        let session_items: id = unsafe { msg_send![session, items] };
+        for i in 0..unsafe { NSArray::count(session_items) } {
+            let item: id = unsafe { NSArray::objectAtIndex(session_items, i) };
+            let item_provider: id = unsafe { msg_send![item, itemProvider] };
             let mut formats = Vec::<String>::new();
-            for f in unsafe { item_provider.registeredTypeIdentifiers().iter() } {
-                let f = f.to_string();
-                if !formats.contains(&f) {
-                    formats.push(f);
+            let identifiers: id = unsafe { msg_send![item_provider, registeredTypeIdentifiers] };
+            for j in 0..unsafe { NSArray::count(identifiers) } {
+                let identifier = unsafe { from_nsstring(NSArray::objectAtIndex(identifiers, j)) };
+                if !formats.contains(&identifier) {
+                    formats.push(identifier);
                 }
             }
             items.push(DropItem {
-                item_id: item.item_id(),
+                item_id: (item as i64).into(),
                 formats,
-                local_data,
+                local_data: local_data.get(i as usize).cloned().unwrap_or(Value::Null),
             });
         }
 
@@ -164,11 +149,11 @@ impl Session {
         })
     }
 
-    fn session_did_update(self: &Rc<Self>) -> NativeExtensionsResult<Id<UIDropProposal>> {
+    fn session_did_update(self: &Rc<Self>) -> NativeExtensionsResult<id> {
         let delegate = self.context_delegate()?;
         let event = self.create_drop_event(false)?;
 
-        let allows_move = unsafe { self.platform_session.allowsMoveOperation() };
+        let allows_move: BOOL = unsafe { msg_send![self.platform_session, allowsMoveOperation] };
 
         let session_clone = self.clone();
         delegate.send_drop_update(
@@ -176,18 +161,19 @@ impl Session {
             event,
             Box::new(move |res| {
                 let mut res = res.ok_log().unwrap_or(DropOperation::None);
-                if res == DropOperation::Move && !allows_move {
+                if res == DropOperation::Move && allows_move == NO {
                     res = DropOperation::Copy;
                 }
                 session_clone.last_operation.replace(res);
             }),
         );
 
-        let operation: UIDropOperation = self.last_operation.get().to_platform();
+        let operation = self.last_operation.get().to_platform();
 
-        let proposal = unsafe {
-            UIDropProposal::initWithDropOperation(self.mtm.alloc::<UIDropProposal>(), operation)
-        };
+        let proposal: id = unsafe { msg_send![class!(UIDropProposal), alloc] };
+        let proposal: id = unsafe { msg_send![proposal, initWithDropOperation: operation] };
+        let () = unsafe { msg_send![proposal, autorelease] };
+
         Ok(proposal)
     }
 
@@ -197,10 +183,8 @@ impl Session {
         let done = Rc::new(Cell::new(false));
         let done_clone = done.clone();
         // TODO(knopp): Let user override default progress indicator
-        unsafe {
-            self.platform_session
-                .setProgressIndicatorStyle(UIDropSessionProgressIndicatorStyle::None)
-        };
+        let () =
+            unsafe { msg_send![self.platform_session, setProgressIndicatorStyle: 0 as NSUInteger] };
         delegate.send_perform_drop(
             self.context_id,
             event,
@@ -250,8 +234,8 @@ impl Session {
         &self,
         response: ItemPreview,
         original_size: Size,
-        default: &UITargetedDragPreview,
-    ) -> Id<UITargetedDragPreview> {
+        default: id, /* UITargetedDragPreview */
+    ) -> id {
         let size = response
             .destination_image
             .as_ref()
@@ -270,28 +254,24 @@ impl Session {
         };
 
         let view_container = unsafe {
-            let bounds = self.context_view.bounds();
-            let container = UIView::initWithFrame(self.mtm.alloc::<UIView>(), bounds);
-            container.setUserInteractionEnabled(false);
-            self.context_view.addSubview(&container);
+            let bounds: CGRect = msg_send![*self.context_view, bounds];
+            let container: id = msg_send![class!(UIView), alloc];
+            let container = StrongPtr::new(msg_send![container, initWithFrame: bounds]);
+            let () = msg_send![*container, setUserInteractionEnabled: NO];
+            let () = msg_send![*self.context_view, addSubview: *container];
 
             let container_clone = container.clone();
-            let animation_block = RcBlock::new(move || {
-                container_clone.setAlpha(0.0);
+            let animation_block = ConcreteBlock::new(move || {
+                let () = msg_send![*container_clone, setAlpha: 0.0];
             });
+            let animation_block = animation_block.copy();
 
-            UIView::animateWithDuration_delay_options_animations_completion(
-                response
-                    .fade_out_duration
-                    .unwrap_or(Self::DEFAULT_FADE_OUT_DURATION),
-                response
-                    .fade_out_delay
-                    .unwrap_or(Self::DEFAULT_FADE_OUT_DELAY),
-                UIViewAnimationOptions::empty(),
-                &animation_block,
-                None,
-                self.mtm,
-            );
+            let () = msg_send![class!(UIView),
+                         animateWithDuration: response.fade_out_duration.unwrap_or(Self::DEFAULT_FADE_OUT_DURATION)
+                         delay: response.fade_out_delay.unwrap_or(Self::DEFAULT_FADE_OUT_DELAY)
+                         options: 0 as NSUInteger
+                         animations:&*animation_block completion:nil];
+
             container
         };
         self.view_containers
@@ -299,51 +279,51 @@ impl Session {
             .push(view_container.clone());
 
         let target = unsafe {
-            UIDragPreviewTarget::initWithContainer_center_transform(
-                self.mtm.alloc::<UIDragPreviewTarget>(),
-                &view_container,
-                center,
-                transform,
-            )
+            let target: id = msg_send![class!(UIDragPreviewTarget), alloc];
+            let () = msg_send![target, initWithContainer: *view_container center: center transform: transform];
+            let () = msg_send![target, autorelease];
+            target
         };
 
         match response.destination_image {
             Some(image) => unsafe {
-                let image_view = image_view_from_data(image, self.mtm);
-                view_container.addSubview(&image_view);
+                let image_view = image_view_from_data(image);
+
+                let () = msg_send![*view_container, addSubview:*image_view];
                 let frame: CGRect = response
                     .destination_rect
                     .translated(-100000.0, -100000.0)
                     .into();
-                image_view.setFrame(frame);
+                let () = msg_send![*image_view, setFrame: frame];
 
-                let parameters =
-                    UIDragPreviewParameters::init(self.mtm.alloc::<UIDragPreviewParameters>());
-                UITargetedDragPreview::initWithView_parameters_target(
-                    self.mtm.alloc::<UITargetedDragPreview>(),
-                    &image_view,
-                    &parameters,
-                    &target,
-                )
+                let parameters: id = msg_send![class!(UIDragPreviewParameters), new];
+                let () = msg_send![parameters, autorelease];
+
+                let preview: id = msg_send![class!(UITargetedDragPreview), alloc];
+                let () = msg_send![preview, initWithView:*image_view parameters:parameters target:target];
+                let () = msg_send![preview, autorelease];
+
+                preview
             },
-            None => unsafe { default.retargetedPreviewWithTarget(&target) },
+            None => unsafe { msg_send![default, retargetedPreviewWithTarget: target] },
         }
     }
 
     fn preview_for_dropping_item(
         &self,
-        item: &UIDragItem,
-        default: &UITargetedDragPreview,
-    ) -> NativeExtensionsResult<Option<Id<UITargetedDragPreview>>> {
+        item: id,    /* UIDragItem */
+        default: id, /* UITargetedDragPreview */
+    ) -> NativeExtensionsResult<id> {
         let delegate = self.context_delegate()?;
-        let view = unsafe { default.view() };
-        let frame = view.frame();
+
+        let view: id = unsafe { msg_send![default, view] };
+        let frame: CGRect = unsafe { msg_send![view, frame] };
         let original_size: Size = frame.size.into();
         let preview_promise = delegate.get_preview_for_item(
             self.context_id,
             ItemPreviewRequest {
                 session_id: self.session_id(),
-                item_id: item.item_id(),
+                item_id: (item as i64).into(),
                 size: original_size.clone(),
                 fade_out_delay: Self::DEFAULT_FADE_OUT_DELAY,
                 fade_out_duration: Self::DEFAULT_FADE_OUT_DURATION,
@@ -356,11 +336,11 @@ impl Session {
                 match result {
                     PromiseResult::Ok { value } => match value.preview {
                         Some(preview) => {
-                            return Ok(Some(self.get_drop_preview(preview, original_size, default)))
+                            return Ok(self.get_drop_preview(preview, original_size, default))
                         }
-                        None => return Ok(None),
+                        None => return Ok(nil),
                     },
-                    PromiseResult::Cancelled => return Ok(None),
+                    PromiseResult::Cancelled => return Ok(nil),
                 }
             }
             RunLoop::current()
@@ -376,17 +356,15 @@ impl PlatformDropContext {
         engine_handle: i64,
         delegate: Weak<dyn PlatformDropContextDelegate>,
     ) -> NativeExtensionsResult<Self> {
-        let mtm = MainThreadMarker::new().unwrap();
         let view = EngineContext::get()?.get_flutter_view(engine_handle)?;
         Ok(Self {
             id,
             weak_self: Late::new(),
-            view: unsafe { Id::cast(view) },
+            view: unsafe { StrongPtr::retain(view) },
             delegate,
             interaction: Late::new(),
             interaction_delegate: Late::new(),
             sessions: RefCell::new(HashMap::new()),
-            mtm,
         })
     }
 
@@ -396,25 +374,21 @@ impl PlatformDropContext {
 
     pub fn assign_weak_self(&self, weak_self: Weak<Self>) {
         self.weak_self.set(weak_self.clone());
-        let delegate = SNEDropContext::new(weak_self, self.mtm);
-        self.interaction_delegate.set(delegate.retain());
-        let interaction = unsafe {
-            UIDropInteraction::initWithDelegate(
-                self.mtm.alloc::<UIDropInteraction>(),
-                &Id::cast(delegate),
-            )
-        };
-        unsafe { self.view.addInteraction(&Id::cast(interaction.clone())) };
-        self.interaction.set(interaction);
+        autoreleasepool(|| unsafe {
+            let delegate: id = msg_send![*DELEGATE_CLASS, new];
+            (*delegate).set_ivar("context", Weak::into_raw(weak_self) as *mut c_void);
+            self.interaction_delegate.set(StrongPtr::new(delegate));
+            let interaction: id = msg_send![class!(UIDropInteraction), alloc];
+            let interaction: id = msg_send![interaction, initWithDelegate: delegate];
+            self.interaction.set(StrongPtr::new(interaction));
+            let () = msg_send![*self.view, addInteraction: interaction];
+        });
     }
 
-    fn get_session(&self, session: &ProtocolObject<dyn UIDropSession>) -> Rc<Session> {
-        let session = unsafe { Id::retain(session as *const _ as *mut _) }.unwrap();
-        let session_id = Session::session_id_(&session);
-        let mtm = self.mtm;
+    fn get_session(&self, session: id) -> Rc<Session> {
         self.sessions
             .borrow_mut()
-            .entry(session_id)
+            .entry(session)
             .or_insert_with(|| {
                 Rc::new(Session {
                     context_id: self.id,
@@ -423,65 +397,46 @@ impl PlatformDropContext {
                     platform_session: session,
                     last_operation: Cell::new(DropOperation::None),
                     view_containers: RefCell::new(Vec::new()),
-                    mtm,
                 })
             })
             .clone()
     }
 
-    fn session_did_update(
-        &self,
-        session: &ProtocolObject<dyn UIDropSession>,
-    ) -> NativeExtensionsResult<Id<UIDropProposal>> {
+    fn session_did_update(&self, session: id) -> NativeExtensionsResult<id> {
         self.get_session(session).session_did_update()
     }
 
-    fn perform_drop(
-        &self,
-        session: &ProtocolObject<dyn UIDropSession>,
-    ) -> NativeExtensionsResult<()> {
+    fn perform_drop(&self, session: id) -> NativeExtensionsResult<()> {
         self.get_session(session).perform_drop()
     }
 
-    fn session_did_exit(
-        &self,
-        session: &ProtocolObject<dyn UIDropSession>,
-    ) -> NativeExtensionsResult<()> {
+    fn session_did_exit(&self, session: id) -> NativeExtensionsResult<()> {
         self.get_session(session).session_did_exit()
     }
 
-    fn session_did_end(
-        &self,
-        session: &ProtocolObject<dyn UIDropSession>,
-    ) -> NativeExtensionsResult<()> {
-        let session_id = Session::session_id_(session);
-        let session = self.sessions.borrow_mut().remove(&session_id);
+    fn session_did_end(&self, session: id) -> NativeExtensionsResult<()> {
+        let session = self.sessions.borrow_mut().remove(&session);
         match session {
             Some(session) => session.session_did_end(),
             None => Ok(()),
         }
     }
 
-    fn preview_for_dropping_item(
-        &self,
-        item: &UIDragItem,
-        default: &UITargetedDragPreview,
-    ) -> NativeExtensionsResult<Option<Id<UITargetedDragPreview>>> {
-        let session_for_item = {
-            let sessions = self.sessions.borrow();
-            sessions.iter().find_map(|(_, s)| {
-                let items = unsafe { s.platform_session.items() };
-                let contains = unsafe { items.containsObject(item) };
-                if contains {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-        };
+    fn preview_for_dropping_item(&self, item: id, default: id) -> NativeExtensionsResult<id> {
+        let session_for_item = self.sessions.borrow().iter().find_map(|(s, _)| {
+            let items: id = unsafe { msg_send![*s, items] };
+            let contains: BOOL = unsafe { msg_send![items, containsObject: item] };
+            if contains == YES {
+                Some(*s)
+            } else {
+                None
+            }
+        });
         match session_for_item {
-            Some(session) => session.preview_for_dropping_item(item, default),
-            None => Ok(None),
+            Some(session) => self
+                .get_session(session)
+                .preview_for_dropping_item(item, default),
+            None => Ok(nil),
         }
     }
 }
@@ -489,140 +444,137 @@ impl PlatformDropContext {
 impl Drop for PlatformDropContext {
     fn drop(&mut self) {
         unsafe {
-            self.view
-                .removeInteraction(&Id::cast(self.interaction.clone()))
-        };
+            let () = msg_send![*self.view, removeInteraction: **self.interaction];
+        }
     }
 }
 
-pub struct Inner {
-    context: Weak<PlatformDropContext>,
-}
-
-impl Inner {
-    fn with_state<F, FR, R>(&self, callback: F, default: FR) -> R
-    where
-        F: FnOnce(Rc<PlatformDropContext>) -> R,
-        FR: FnOnce() -> R,
-    {
-        let context = self.context.upgrade();
-        match context {
-            Some(context) => callback(context),
+fn with_state<F, FR, R>(this: id, callback: F, default: FR) -> R
+where
+    F: FnOnce(Rc<PlatformDropContext>) -> R,
+    FR: FnOnce() -> R,
+{
+    unsafe {
+        let context_ptr = {
+            let context_ptr: *mut c_void = *(*this).get_ivar("context");
+            context_ptr as *const PlatformDropContext
+        };
+        let this = ManuallyDrop::new(Weak::from_raw(context_ptr));
+        let this = this.upgrade();
+        match this {
+            Some(this) => callback(this),
             None => default(),
         }
     }
 }
 
-declare_class!(
-    struct SNEDropContext;
+extern "C" fn dealloc(this: &Object, _sel: Sel) {
+    unsafe {
+        let context_ptr = {
+            let context_ptr: *mut c_void = *this.get_ivar("context");
+            context_ptr as *const PlatformDropContext
+        };
+        Weak::from_raw(context_ptr);
 
-    unsafe impl ClassType for SNEDropContext {
-        type Super = NSObject;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "SNEDropContext";
-    }
-
-    impl DeclaredClass for SNEDropContext {
-        type Ivars = Inner;
-    }
-
-    unsafe impl NSObjectProtocol for SNEDropContext {}
-
-    #[allow(non_snake_case)]
-    unsafe impl UIDropInteractionDelegate for SNEDropContext {
-        #[method(dropInteraction:canHandleSession:)]
-        fn dropInteraction_canHandleSession(
-            &self,
-            _interaction: &UIDropInteraction,
-            _session: &ProtocolObject<dyn UIDropSession>,
-        ) -> bool {
-            true
-        }
-
-        #[method_id(dropInteraction:sessionDidUpdate:)]
-        fn dropInteraction_sessionDidUpdate(
-            &self,
-            _interaction: &UIDropInteraction,
-            session: &ProtocolObject<dyn UIDropSession>,
-        ) -> Id<UIDropProposal> {
-            let fallback = || unsafe {
-                let mtm = MainThreadMarker::new().unwrap();
-                UIDropProposal::initWithDropOperation(
-                    mtm.alloc::<UIDropProposal>(),
-                    UIDropOperation::Cancel,
-                )
-            };
-            self.ivars().with_state(
-                |state| {
-                    state
-                        .session_did_update(session)
-                        .ok_log()
-                        .unwrap_or_else(fallback)
-                },
-                fallback,
-            )
-        }
-
-        #[method(dropInteraction:sessionDidExit:)]
-        fn dropInteraction_sessionDidExit(
-            &self,
-            _interaction: &UIDropInteraction,
-            session: &ProtocolObject<dyn UIDropSession>,
-        ) {
-            self.ivars().with_state(
-                |state| state.session_did_exit(session).ok_log().unwrap_or(()),
-                || (),
-            )
-        }
-
-        #[method(dropInteraction:performDrop:)]
-        fn dropInteraction_performDrop(
-            &self,
-            _interaction: &UIDropInteraction,
-            session: &ProtocolObject<dyn UIDropSession>,
-        ) {
-            self.ivars().with_state(
-                |state| state.perform_drop(session).ok_log().unwrap_or(()),
-                || (),
-            )
-        }
-
-        #[method(dropInteraction:sessionDidEnd:)]
-        fn dropInteraction_sessionDidEnd(
-            &self,
-            _interaction: &UIDropInteraction,
-            session: &ProtocolObject<dyn UIDropSession>,
-        ) {
-            self.ivars().with_state(
-                |state| state.session_did_end(session).ok_log().unwrap_or(()),
-                || (),
-            )
-        }
-
-        #[method_id(dropInteraction:previewForDroppingItem:withDefault:)]
-        fn dropInteraction_previewForDroppingItem_withDefault(
-            &self,
-            _interaction: &UIDropInteraction,
-            item: &UIDragItem,
-            default_preview: &UITargetedDragPreview,
-        ) -> Option<Id<UITargetedDragPreview>> {
-            self.ivars().with_state(
-                |state| {
-                    state
-                        .preview_for_dropping_item(item, default_preview)
-                        .ok_log()
-                        .unwrap_or(None)
-                },
-                || None,
-            )
-        }
-    }
-);
-
-impl SNEDropContext {
-    fn new(context: Weak<PlatformDropContext>, mtm: MainThreadMarker) -> Id<Self> {
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(Inner { context });
-        unsafe { msg_send_id![super(this), init] }
+        let () = msg_send![super(this, *SUPERCLASS), dealloc];
     }
 }
+
+extern "C" fn can_handle_session(
+    _this: &Object,
+    _sel: Sel,
+    _interaction: id,
+    _session: id,
+) -> BOOL {
+    YES
+}
+
+extern "C" fn session_did_update(
+    this: &mut Object,
+    _sel: Sel,
+    _interaction: id,
+    session: id,
+) -> id {
+    with_state(
+        this,
+        |state| state.session_did_update(session).ok_log().unwrap_or(nil),
+        || nil,
+    )
+}
+
+extern "C" fn perform_drop(this: &mut Object, _sel: Sel, _interaction: id, session: id) {
+    with_state(
+        this,
+        |state| state.perform_drop(session).ok_log().unwrap_or(()),
+        || (),
+    )
+}
+
+extern "C" fn session_did_exit(this: &mut Object, _sel: Sel, _interaction: id, session: id) {
+    with_state(
+        this,
+        |state| state.session_did_exit(session).ok_log().unwrap_or(()),
+        || (),
+    )
+}
+
+extern "C" fn session_did_end(this: &mut Object, _sel: Sel, _interaction: id, session: id) {
+    with_state(
+        this,
+        |state| state.session_did_end(session).ok_log().unwrap_or(()),
+        || (),
+    )
+}
+
+extern "C" fn preview_for_dropping_item(
+    this: &mut Object,
+    _sel: Sel,
+    _interaction: id,
+    item: id,
+    default: id,
+) -> id {
+    with_state(
+        this,
+        |state| {
+            state
+                .preview_for_dropping_item(item, default)
+                .ok_log()
+                .unwrap_or(nil)
+        },
+        || nil,
+    )
+}
+
+static SUPERCLASS: Lazy<&'static Class> = Lazy::new(|| class!(NSObject));
+
+static DELEGATE_CLASS: Lazy<&'static Class> = Lazy::new(|| unsafe {
+    let mut decl = ClassDecl::new("SNEDropInteractionDelegate", *SUPERCLASS).unwrap();
+    decl.add_protocol(Protocol::get("UIDropInteractionDelegate").unwrap());
+    decl.add_ivar::<*mut c_void>("context");
+    decl.add_method(sel!(dealloc), dealloc as extern "C" fn(&Object, Sel));
+    decl.add_method(
+        sel!(dropInteraction:canHandleSession:),
+        can_handle_session as extern "C" fn(&Object, Sel, id, id) -> BOOL,
+    );
+    decl.add_method(
+        sel!(dropInteraction:sessionDidUpdate:),
+        session_did_update as extern "C" fn(&mut Object, Sel, id, id) -> id,
+    );
+    decl.add_method(
+        sel!(dropInteraction:performDrop:),
+        perform_drop as extern "C" fn(&mut Object, Sel, id, id),
+    );
+    decl.add_method(
+        sel!(dropInteraction:sessionDidExit:),
+        session_did_exit as extern "C" fn(&mut Object, Sel, id, id),
+    );
+    decl.add_method(
+        sel!(dropInteraction:sessionDidEnd:),
+        session_did_end as extern "C" fn(&mut Object, Sel, id, id),
+    );
+    decl.add_method(
+        sel!(dropInteraction:previewForDroppingItem:withDefault:),
+        preview_for_dropping_item as extern "C" fn(&mut Object, Sel, id, id, id) -> id,
+    );
+    decl.register()
+});

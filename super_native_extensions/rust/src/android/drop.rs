@@ -3,14 +3,14 @@ use std::{
     collections::HashMap,
     rc::{Rc, Weak},
     sync::Arc,
-    thread,
 };
 
 use irondash_engine_context::EngineContext;
 use irondash_message_channel::{IsolateId, Value};
+use irondash_run_loop::RunLoop;
 use jni::{
     objects::{GlobalRef, JClass, JObject, JString, JValue},
-    sys::{jint, jlong, jvalue},
+    sys::{jlong, jvalue},
     JNIEnv,
 };
 
@@ -25,7 +25,6 @@ use crate::{
     log::OkLog,
     reader_manager::RegisteredDataReader,
     util::{DropNotifier, NextId},
-    value_promise::Promise,
 };
 
 use super::{
@@ -141,7 +140,7 @@ impl PlatformDropContext {
                 // be number or local items (if any), or 1. Each item will have types
                 // from clip description set.
                 let clip_description = event.get_clip_description(env)?;
-                let mime_types = if env.is_same_object(&clip_description, JObject::null())? {
+                let mime_types = if env.is_same_object(&clip_description, &JObject::null())? {
                     Vec::default()
                 } else {
                     let mime_type_count = env
@@ -340,7 +339,7 @@ impl PlatformDropContext {
                         let local_data = get_local_data();
                         let clip_data = event.get_clip_data(env)?;
 
-                        let reader = if env.is_same_object(&clip_data, JObject::null())? {
+                        let reader = if env.is_same_object(&clip_data, &JObject::null())? {
                             None
                         } else {
                             // If this is local data make sure to extend the lifetime
@@ -372,13 +371,19 @@ impl PlatformDropContext {
                             Some(accepted_operation),
                             reader,
                         )?;
+                        let done = Rc::new(Cell::new(false));
+                        let done_clone = done.clone();
                         delegate.send_perform_drop(
                             self.id,
                             event,
                             Box::new(move |r| {
                                 r.ok_log();
+                                done_clone.set(true);
                             }),
                         );
+                        while !done.get() {
+                            RunLoop::current().platform_run_loop.poll_once();
+                        }
                         Ok(true)
                     } else {
                         Ok(false)
@@ -404,35 +409,26 @@ impl PlatformDropContext {
 
 impl Drop for PlatformDropContext {
     fn drop(&mut self) {
-        CONTEXTS.try_with(|c| c.borrow_mut().remove(&self.id)).ok();
+        CONTEXTS.with(|c| c.borrow_mut().remove(&self.id));
     }
 }
 
 fn update_last_touch_point<'a>(
     env: &mut JNIEnv<'a>,
     view_root: JObject<'a>,
-    x: i32,
-    y: i32,
+    event: &JObject<'a>,
 ) -> NativeExtensionsResult<()> {
-    let view_root_global = env.new_global_ref(&view_root)?;
-    let jvm = env.get_java_vm()?;
-    let p = Arc::new(Promise::new());
-    let p2 = p.clone();
-    thread::spawn(move || {
-        let update = move || -> NativeExtensionsResult<()> {
-            let mut env = jvm.attach_current_thread()?;
-            let view_root = view_root_global.as_obj();
-            let last_touch_point = env
-                .get_field(view_root, "mLastTouchPoint", "Landroid/graphics/PointF;")?
-                .l()?;
-            env.set_field(&last_touch_point, "x", "F", (x as f32).into())?;
-            env.set_field(&last_touch_point, "y", "F", (y as f32).into())?;
-            Ok(())
-        };
-        p.set(update());
-    });
-    p2.wait()?;
-
+    env.call_method(
+        view_root,
+        "enqueueInputEvent",
+        "(Landroid/view/InputEvent;Landroid/view/InputEventReceiver;IZ)V",
+        &[
+            (&event).into(),
+            (&JObject::null()).into(),
+            1.into(),
+            true.into(),
+        ],
+    )?;
     Ok(())
 }
 
@@ -444,10 +440,9 @@ pub extern "C" fn Java_com_superlist_super_1native_1extensions_DragDropHelper_up
     mut env: JNIEnv<'a>,
     _class: JClass,
     view_root: JObject<'a>,
-    x: jint,
-    y: jint,
+    event: JObject<'a>,
 ) {
-    update_last_touch_point(&mut env, view_root, x, y).ok_log();
+    update_last_touch_point(&mut env, view_root, &event).ok_log();
 }
 
 #[no_mangle]

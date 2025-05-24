@@ -76,8 +76,7 @@ impl PlatformDragContext {
                 let a = image.data[pos + 3] as i32;
                 // Contrary to what ARGB_8888 documentation says the colors are
                 // indeed encoded in ARGB order.
-                let color =
-                    ((a & 0xff) << 24) | ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff);
+                let color = (a & 0xff) << 24 | (r & 0xff) << 16 | (g & 0xff) << 8 | (b & 0xff);
                 tmp[y * image.width as usize + x] = color;
             }
         }
@@ -289,6 +288,6 @@ impl DragSession {
 
 impl Drop for PlatformDragContext {
     fn drop(&mut self) {
-        CONTEXTS.try_with(|c| c.borrow_mut().remove(&self.id)).ok();
+        CONTEXTS.with(|c| c.borrow_mut().remove(&self.id));
     }
 }

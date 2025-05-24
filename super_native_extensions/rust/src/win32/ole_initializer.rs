@@ -6,7 +6,7 @@ pub struct OleInitializer {
 
 impl OleInitializer {
     pub fn new() -> OleInitializer {
-        let res = unsafe { OleInitialize(None) };
+        let res = unsafe { OleInitialize(std::ptr::null_mut()) };
         OleInitializer {
             need_uninit: res.is_ok(),
         }

@@ -39,13 +39,13 @@ class _LayoutDemoWidgetState extends State<LayoutDemoWidget> {
   void initState() {
     super.initState();
     _focusNode = FocusNode(debugLabel: 'Example focus node');
-    _focusNode.onKeyEvent = _onKeyEvent;
+    _focusNode.onKey = _onKey;
     _focusNode.requestFocus();
     _keyboardLayoutManager.onLayoutChanged.addListener(_layoutChanged);
   }
 
-  KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
-    if (event is KeyDownEvent) {
+  KeyEventResult _onKey(FocusNode node, RawKeyEvent event) {
+    if (event is RawKeyDownEvent) {
       setState(() {
         _lastKey = event.physicalKey;
       });

@@ -42,7 +42,7 @@ static DATA_PROVIDERS: Lazy<Mutex<HashMap<i64, DataProviderRecord>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
-    static NEXT_ID: Cell<i64> = const { Cell::new(1) };
+    static NEXT_ID: Cell<i64> = Cell::new(1);
 }
 
 pub struct PlatformDataProvider {
@@ -259,7 +259,7 @@ impl PlatformDataProvider {
         let mut clip_data = JObject::null();
 
         for item in items {
-            if env.is_same_object(&clip_data, JObject::null())? {
+            if env.is_same_object(&clip_data, &JObject::null())? {
                 clip_data = env.new_object(
                     "android/content/ClipData",
                     "(Landroid/content/ClipDescription;Landroid/content/ClipData$Item;)V",
@@ -285,7 +285,7 @@ impl PlatformDataProvider {
         let providers: Vec<_> = providers.into_iter().map(|p| p.0).collect();
 
         thread_local! {
-            static CURRENT_CLIP: RefCell<Vec<Arc<DataProviderHandle>>> = const { RefCell::new(Vec::new()) };
+            static CURRENT_CLIP: RefCell<Vec<Arc<DataProviderHandle>>> = RefCell::new(Vec::new());
         }
         // ClipManager doesn't provide any lifetime management for clip so just
         // keep the data awake until the clip is replaced.
@@ -424,9 +424,7 @@ fn get_data_for_uri<'a>(
         let data = value.coerce_to_data(StringFormat::Utf8).unwrap_or_default();
         let res = env.new_byte_array(data.len() as i32).unwrap();
         let data: &[u8] = &data;
-        env.set_byte_array_region(&res, 0, unsafe {
-            std::mem::transmute::<&[u8], &[i8]>(data)
-        })?;
+        env.set_byte_array_region(&res, 0, unsafe { std::mem::transmute(data) })?;
         Ok(res.into())
     }
 

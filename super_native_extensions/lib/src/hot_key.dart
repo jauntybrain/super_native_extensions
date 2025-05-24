@@ -1,4 +1,4 @@
-import 'native/hot_key.dart' if (dart.library.js_interop) 'web/hot_key.dart';
+import 'native/hot_key.dart' if (dart.library.js) 'web/hot_key.dart';
 
 class HotKeyDefinition {
   final int platformCode;
@@ -26,8 +26,7 @@ class HotKeyDefinition {
 
 abstract class HotKeyManagerDelegate {
   /// Invoked when hot key with given handle is pressed.
-  void onHotKeyPressed(int handle);
-  void onHotKeyReleased(int handle);
+  void onHotKey(int handle);
 }
 
 abstract class HotKeyManager {

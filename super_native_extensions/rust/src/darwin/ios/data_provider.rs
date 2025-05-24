@@ -9,16 +9,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use block2::RcBlock;
+use block::ConcreteBlock;
+use cocoa::{
+    base::{id, nil},
+    foundation::{NSArray, NSProcessInfo, NSURL},
+};
+
 use irondash_message_channel::{IsolateId, Late};
 use irondash_run_loop::{spawn, util::Capsule, RunLoop, RunLoopSender};
-use objc2::{
-    extern_class, extern_methods, mutability::InteriorMutable, rc::Id, runtime::NSObject, ClassType,
+use objc::{
+    class, msg_send,
+    rc::{autoreleasepool, StrongPtr},
+    sel, sel_impl,
 };
-use objc2_foundation::{
-    NSArray, NSData, NSError, NSItemProvider, NSProcessInfo, NSProgress, NSString, NSURL,
-};
-use objc2_ui_kit::UIPasteboard;
 use once_cell::sync::Lazy;
 
 use crate::{
@@ -28,7 +31,7 @@ use crate::{
     },
     error::NativeExtensionsResult,
     log::OkLog,
-    platform_impl::platform::common::to_nserror,
+    platform_impl::platform::common::{from_nsstring, to_nsdata, to_nserror, to_nsstring},
     util::Movable,
     value_promise::ValuePromiseResult,
 };
@@ -49,11 +52,6 @@ pub struct PlatformDataProvider {
     delegate: Weak<dyn PlatformDataProviderDelegate>,
     isolate_id: IsolateId,
     state: Arc<Mutex<PlatformDataProviderState>>,
-}
-
-enum VirtualFilePayload {
-    Url(Id<NSURL>),
-    Data(Id<NSData>),
 }
 
 impl PlatformDataProvider {
@@ -81,17 +79,18 @@ impl PlatformDataProvider {
         &self,
         handle: Option<Arc<DataProviderHandle>>,
         delegate: Option<Weak<dyn DataProviderSessionDelegate>>,
-    ) -> Id<NSItemProvider> {
+    ) -> StrongPtr {
         let delegate = delegate.unwrap_or_else(|| self.weak_self.clone());
         let session =
             DataProviderSession::new(self.state.clone(), handle, self.weak_self.clone(), delegate);
         let state = self.state.lock().unwrap();
         let item = &state.provider;
         unsafe {
-            let item_provider = NSItemProvider::init(NSItemProvider::alloc());
-
+            let item_provider: id = msg_send![class!(NSItemProvider), new];
+            let item_provider = StrongPtr::new(item_provider);
             if let Some(name) = &item.suggested_name {
-                item_provider.setSuggestedName(Some(&NSString::from_str(name)));
+                let name = to_nsstring(name);
+                let () = msg_send![*item_provider, setSuggestedName:*name];
             }
             for representation in &item.representations {
                 let format = match representation {
@@ -102,7 +101,7 @@ impl PlatformDataProvider {
                 if let Some(format) = format {
                     let session_clone = session.clone();
                     let format_clone = format.clone();
-                    register_data_representation(&item_provider, format, move |callback| {
+                    register_data_representation(*item_provider, format, move |callback| {
                         session_clone.value_for_format(&format_clone, callback)
                     });
                 }
@@ -118,45 +117,18 @@ impl PlatformDataProvider {
                     match storage {
                         VirtualFileStorage::TemporaryFile => {
                             register_file_representation(
-                                &item_provider,
+                                *item_provider,
                                 format,
-                                true,
+                                false,
                                 move |callback| {
-                                    let callback2 = Box::new(
-                                        move |data: Option<VirtualFilePayload>,
-                                              must_use_presenter: bool,
-                                              error: Option<&NSError>| {
-                                            match data {
-                                                Some(VirtualFilePayload::Url(url)) => {
-                                                    callback(Some(&url), must_use_presenter, error)
-                                                },
-                                                None => {
-                                                    callback(None, must_use_presenter, error)
-                                                },
-                                                _ => {
-                                                    panic!("Unexpected data type");
-                                                }
-                                            }
-                                        },
-                                    );
-                                    session_clone.file_representation(id, storage, callback2)
+                                    session_clone.file_representation(id, storage, callback)
                                 },
                             );
                         }
                         VirtualFileStorage::Memory => {
-                            register_data_representation(&item_provider, format, move |callback| {
-                                let callback2 = Box::new(move |data: Option<VirtualFilePayload>, _: bool, error: Option<&NSError>| {
-                                    match data {
-                                        Some(VirtualFilePayload::Data(data)) => {
-                                            callback(Some(&data), error)
-                                        },
-                                        None => {
-                                            callback(None,  error)
-                                        },
-                                        _ => {
-                                            panic!("Unexpected data type");
-                                        }
-                                    };
+                            register_data_representation(*item_provider, format, move |callback| {
+                                let callback2 = Box::new(move |data: id, _: bool, error: id| {
+                                    callback(data, error)
                                 });
                                 session_clone.file_representation(id, storage, callback2)
                             });
@@ -175,16 +147,20 @@ impl PlatformDataProvider {
             provider.0.precache().await;
         }
 
-        let providers: Vec<Id<NSItemProvider>> = providers
+        let providers: Vec<id> = providers
             .into_iter()
             .map(|(platform_data_provider, provider_handle)| {
-                platform_data_provider.create_ns_item_provider(Some(provider_handle), None)
+                platform_data_provider
+                    .create_ns_item_provider(Some(provider_handle), None)
+                    .autorelease()
             })
             .collect();
 
-        let array = NSArray::from_vec(providers);
-        let pasteboard = unsafe { UIPasteboard::generalPasteboard() };
-        unsafe { pasteboard.setItemProviders(&array) };
+        autoreleasepool(|| unsafe {
+            let array = NSArray::arrayWithObjects(nil, &providers);
+            let pasteboard: id = msg_send![class!(UIPasteboard), generalPasteboard];
+            let () = msg_send![pasteboard, setItemProviders: array];
+        });
 
         Ok(())
     }
@@ -285,45 +261,40 @@ impl DataProviderSession {
         });
     }
 
-    fn fetch_value(
-        &self,
-        id: DataProviderValueId,
-        callback: Box<dyn Fn(Option<&NSData>, Option<&NSError>) + Send>,
-    ) -> Option<Id<NSProgress>> {
+    fn fetch_value(&self, id: DataProviderValueId, callback: Box<dyn Fn(id, id) + Send>) -> id {
         Self::on_platform_thread(self, move |s| match s {
             Some((source, source_delegate, session_delegate)) => {
-                // For some reason iOS seems to eagerly fetch items immediately
+                // For some reason iOS seems to eagerly fetch items immediatelly
                 // at the beginning of drag (before even dragInteraction:sessionWillBegin:).
                 // If we detect that return empty data.
                 if !session_delegate.should_fetch_items() {
-                    callback(None, None);
+                    callback(nil, nil);
                     return;
                 }
                 spawn(async move {
                     let data = source_delegate
                         .get_lazy_data_async(source.isolate_id, id)
                         .await;
-                    let data = value_promise_res_to_nsdata(&data);
-                    callback(data.as_deref(), None);
+                    callback(*value_promise_res_to_nsdata(&data), nil);
                 });
             }
             None => {
-                callback(None, None);
+                callback(nil, nil);
             }
         });
-        None
+        nil // NSProgress
     }
 
     fn value_for_format(
         self: &Arc<Self>,
         requested_format: &String,
-        callback: Box<dyn Fn(Option<&NSData>, Option<&NSError>) + Send>,
-    ) -> Option<Id<NSProgress>> {
+        callback: Box<dyn Fn(id, id) + Send>,
+    ) -> id {
         let state = match self.state.upgrade() {
             Some(state) => state,
             None => {
-                callback(None, None);
-                return None;
+                callback(nil, nil);
+                return nil;
             }
         };
         let state = state.lock().unwrap();
@@ -333,8 +304,8 @@ impl DataProviderSession {
                 DataRepresentation::Simple { format, data } => {
                     if format == requested_format {
                         let data = value_to_nsdata(data);
-                        callback(data.as_deref(), None);
-                        return None;
+                        callback(*data, nil);
+                        return nil;
                     }
                 }
                 DataRepresentation::Lazy { format, id } => {
@@ -343,8 +314,8 @@ impl DataProviderSession {
                         match precached {
                             Some(value) => {
                                 let data = value_promise_res_to_nsdata(value);
-                                callback(data.as_deref(), None);
-                                return None;
+                                callback(*data, nil);
+                                return nil;
                             }
                             None => return self.fetch_value(*id, callback),
                         }
@@ -353,15 +324,15 @@ impl DataProviderSession {
                 _ => {}
             }
         }
-        callback(None, None);
-        None
+        callback(nil, nil);
+        nil // NSProgress
     }
 
     fn temp_file_path() -> PathBuf {
         let guid = unsafe {
-            let info = NSProcessInfo::processInfo();
-            let string = info.globallyUniqueString();
-            string.to_string()
+            let info = NSProcessInfo::processInfo(nil);
+            let string: id = msg_send![info, globallyUniqueString];
+            from_nsstring(string)
         };
         temp_dir().join(guid)
     }
@@ -369,7 +340,7 @@ impl DataProviderSession {
     fn new_stream_handle_for_storage(storage: VirtualFileStorage) -> Option<i32> {
         fn next_stream_entry_handle() -> i32 {
             thread_local! {
-                static NEXT_STREAM_ENTRY_HANDLE : Cell<i32> = const { Cell::new(0) }
+                static NEXT_STREAM_ENTRY_HANDLE : Cell<i32>  = Cell::new(0)
             }
             NEXT_STREAM_ENTRY_HANDLE.with(|handle| {
                 let res = handle.get();
@@ -399,80 +370,76 @@ impl DataProviderSession {
         }
     }
 
-    fn finish_stream_handle(stream_handle: i32) -> Option<VirtualFilePayload> {
+    fn finish_stream_handle(stream_handle: i32) -> id {
         let stream_entry = STREAM_ENTRIES.lock().unwrap().remove(&stream_handle);
         match stream_entry {
             Some(StreamEntry::File { path, file }) => {
                 drop(file);
                 let path = path.to_string_lossy();
-                let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(&path)) };
-                unsafe { SNEDeletingPresenter::deleteAfterRead(&url) };
-                Some(VirtualFilePayload::Url(url))
+                unsafe {
+                    let url = NSURL::fileURLWithPath_(nil, *to_nsstring(&path));
+                    let () = msg_send![class!(SNEDeletingPresenter), deleteAfterRead: url];
+                    url
+                }
             }
-            Some(StreamEntry::Memory { buffer }) => {
-                Some(VirtualFilePayload::Data(NSData::from_vec(buffer)))
-            }
-            None => None,
+            Some(StreamEntry::Memory { buffer }) => to_nsdata(&buffer).autorelease(),
+            None => nil,
         }
     }
 
     fn fetch_virtual_file(
         self: &Arc<Self>,
         id: DataProviderValueId,
-        progress: &NSProgress,
+        progress: StrongPtr,
         storage: VirtualFileStorage,
-        callback: Box<dyn Fn(Option<VirtualFilePayload>, bool, Option<&NSError>) + Send>,
+        callback: Box<dyn Fn(id, bool, id) + Send>,
     ) {
-        let progress = progress.retain();
         let progress = unsafe { Movable::new(progress) };
         let self_clone = self.clone();
         Self::on_platform_thread(self, move |s| match s {
             Some((source, source_delegate, session_delegate)) => {
                 let progress = progress.take();
-                // For some reason iOS seems to eagerly fetch items immediately
+                // For some reason iOS seems to eagerly fetch items immediatelly
                 // at the beginning of drag (before even dragInteraction:sessionWillBegin:).
                 // If we detect that return empty data.
                 if !session_delegate.should_fetch_items() {
-                    callback(None, false, None);
+                    callback(nil, false, nil);
                     return;
                 }
 
                 let stream_handle = Self::new_stream_handle_for_storage(storage);
                 if stream_handle.is_none() {
                     callback(
-                        None,
+                        nil,
                         false,
-                        Some(&to_nserror(
-                            "super_dnd",
-                            0,
-                            "Failed to open temporary file for writing",
-                        )),
+                        *to_nserror("super_dnd", 0, "Failed to open temporary file for writing"),
                     );
                     return;
                 }
                 let stream_handle = stream_handle.unwrap();
 
-                let progress_clone = progress.retain();
+                let progress_clone = progress.clone();
                 let notifier = source_delegate.get_virtual_file(
                     source.isolate_id,
                     id,
                     stream_handle,
                     Box::new(move |_| {}),
                     Box::new(move |cnt| {
-                        let completed = (cnt * 1000.0).round() as i64;
-                        unsafe { progress_clone.setCompletedUnitCount(completed) };
+                        let completed = (cnt * 1000.0).round() as u64;
+                        let () =
+                            unsafe { msg_send![*progress_clone, setCompletedUnitCount: completed] };
                     }),
                     Box::new(move |result| match result {
                         VirtualFileResult::Done => {
                             let data = Self::finish_stream_handle(stream_handle);
-                            callback(data, true /* must use presenter */, None);
+                            callback(data, true /* must use presenter */, nil);
                         }
                         VirtualFileResult::Error { message } => {
                             let error = to_nserror("super_dnd", 0, &message);
-                            callback(None, false, Some(&error));
+                            callback(nil, false, *error);
                         }
                         VirtualFileResult::Cancelled => {
-                            callback(None, false, None);
+                            callback(nil, false, nil);
                         }
                     }),
                 );
@@ -482,16 +449,18 @@ impl DataProviderSession {
                     .unwrap()
                     .push(notifier.clone());
                 let notifier = Arc::downgrade(&notifier);
-                let cancellation_handler = RcBlock::new(move || {
+                let cancellation_handler = ConcreteBlock::new(move || {
                     if let Some(notifier) = notifier.upgrade() {
                         notifier.dispose();
                     }
                 });
-
-                unsafe { progress.setCancellationHandler(Some(&cancellation_handler)) };
+                let cancellation_handler = cancellation_handler.copy();
+                unsafe {
+                    let () = msg_send![*progress, setCancellationHandler:&*cancellation_handler];
+                }
             }
             None => {
-                callback(None, false, None);
+                callback(nil, false, nil);
             }
         });
     }
@@ -500,11 +469,15 @@ impl DataProviderSession {
         self: &Arc<Self>,
         id: DataProviderValueId,
         storage: VirtualFileStorage,
-        callback: Box<dyn Fn(Option<VirtualFilePayload>, bool, Option<&NSError>) + Send>,
-    ) -> Option<Id<NSProgress>> {
-        let progress = unsafe { NSProgress::progressWithTotalUnitCount(1000) };
-        self.fetch_virtual_file(id, &progress, storage, callback);
-        Some(progress)
+        callback: Box<dyn Fn(id, bool, id) + Send>,
+    ) -> id {
+        unsafe {
+            let progress = StrongPtr::retain(
+                msg_send![class!(NSProgress), discreteProgressWithTotalUnitCount: 1000u64],
+            );
+            self.fetch_virtual_file(id, progress.clone(), storage, callback);
+            *progress
+        }
     }
 }
 
@@ -562,21 +535,3 @@ pub fn platform_stream_close(handle: i32, delete: bool) {
         }
     }
 }
-
-extern_class!(
-    #[derive(PartialEq, Eq, Hash)]
-    pub struct SNEDeletingPresenter;
-
-    unsafe impl ClassType for SNEDeletingPresenter {
-        type Super = NSObject;
-        type Mutability = InteriorMutable;
-    }
-);
-
-extern_methods!(
-    unsafe impl SNEDeletingPresenter {
-        #[method(deleteAfterRead:)]
-        #[allow(non_snake_case)]
-        pub unsafe fn deleteAfterRead(url: &NSURL);
-    }
-);

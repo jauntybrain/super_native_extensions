@@ -2,21 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../data_provider.dart';
 import '../reader.dart';
 import '../reader_manager.dart';
-
-/// Unlike native implementation, item handle on web contains the actual implementation and
-/// [ReaderManagerImpl] merely forwards calls to the handle.
-abstract class $DataReaderItemHandle {
-  Future<List<String>> getFormats();
-  Future<Object?> getDataForFormat(String format);
-  Future<String?> suggestedName();
-  Future<bool> canGetVirtualFile(String format);
-  Future<VirtualFileReceiver?> createVirtualFileReceiver(
-    DataReaderItemHandle handle, {
-    required String format,
-  });
-}
 
 class SimpleProgress extends ReadProgress {
   @override
@@ -36,12 +24,69 @@ class SimpleProgress extends ReadProgress {
   final _fraction = ValueNotifier<double?>(null);
 }
 
-class $DataReaderHandle {
-  $DataReaderHandle(this.items);
-  final List<$DataReaderItemHandle> items;
+class DataReaderHandleImpl {
+  DataReaderHandleImpl(this.items);
+  final List<DataReaderItemHandleImpl> items;
 }
 
-/// ReaderManagerImpl on web forwards calls to underlying handles.
+abstract class DataReaderItemHandleImpl {
+  Future<List<String>> getFormats();
+  Future<Object?> getDataForFormat(String format);
+  Future<String?> suggestedName();
+  Future<bool> canGetVirtualFile(String format);
+  Future<VirtualFileReceiver?> createVirtualFileReceiver(
+    DataReaderItemHandle handle, {
+    required String format,
+  });
+}
+
+class DataProviderReaderItem extends DataReaderItemHandleImpl {
+  DataProviderReaderItem(this.provider);
+
+  final DataProviderHandle provider;
+
+  @override
+  Future<Object?> getDataForFormat(String format) async {
+    for (final representation in provider.provider.representations) {
+      if (representation is DataRepresentationSimple) {
+        if (representation.format == format) {
+          return representation.data;
+        }
+      } else if (representation is DataRepresentationLazy) {
+        if (representation.format == format) {
+          return representation.dataProvider();
+        }
+      }
+    }
+    return null;
+  }
+
+  @override
+  Future<List<String>> getFormats() async {
+    return provider.provider.representations
+        .map((e) => e.format)
+        .toList(growable: false);
+  }
+
+  @override
+  Future<String?> suggestedName() async {
+    return provider.provider.suggestedName;
+  }
+
+  @override
+  Future<bool> canGetVirtualFile(String format) async {
+    return false;
+  }
+
+  @override
+  Future<VirtualFileReceiver?> createVirtualFileReceiver(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) async {
+    return null;
+  }
+}
+
 class ReaderManagerImpl extends ReaderManager {
   @override
   Future<void> dispose(DataReaderHandle reader) async {
@@ -53,7 +98,7 @@ class ReaderManagerImpl extends ReaderManager {
     DataReaderItemHandle handle, {
     required String format,
   }) {
-    final impl = handle as $DataReaderItemHandle;
+    final impl = handle as DataReaderItemHandleImpl;
     final progress = SimpleProgress();
     final res = impl.getDataForFormat(format);
     final completer = Completer<Object?>();
@@ -69,50 +114,51 @@ class ReaderManagerImpl extends ReaderManager {
 
   @override
   Future<List<String>> getItemFormats(DataReaderItemHandle handle) {
-    final impl = handle as $DataReaderItemHandle;
+    final impl = handle as DataReaderItemHandleImpl;
     return impl.getFormats();
   }
 
   @override
+  Future<String?> getItemSuggestedName(DataReaderItemHandle handle) {
+    final impl = handle as DataReaderItemHandleImpl;
+    return impl.suggestedName();
+  }
+
+  @override
+  Future<bool> itemFormatIsSynthesized(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) async {
+    return false;
+  }
+
+  @override
   Future<List<DataReaderItemHandle>> getItems(DataReaderHandle reader) async {
-    final handle = reader as $DataReaderHandle;
+    final handle = reader as DataReaderHandleImpl;
     return handle.items.map((e) => e as DataReaderItemHandle).toList();
   }
 
   @override
-  Future<List<DataReaderItemInfo>> getItemInfo(
-    Iterable<DataReaderItemHandle> handles, {
-    Duration? timeout,
+  Future<bool> canGetVirtualFile(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) {
+    final impl = handle as DataReaderItemHandleImpl;
+    return impl.canGetVirtualFile(format);
+  }
+
+  @override
+  Future<VirtualFileReceiver?> createVirtualFileReceiver(
+    DataReaderItemHandle handle, {
+    required String format,
   }) async {
-    final res = <DataReaderItemInfo>[];
-    final stopwatch = Stopwatch()..start();
-    for (final handle in handles) {
-      final impl = handle as $DataReaderItemHandle;
-      final formats = await impl.getFormats();
-      final receivers = <VirtualFileReceiver>[];
-      for (final format in formats) {
-        if (await impl.canGetVirtualFile(format)) {
-          final receiver =
-              await impl.createVirtualFileReceiver(handle, format: format);
-          if (receiver != null) {
-            receivers.add(receiver);
-          }
-        }
-      }
-      final info = DataReaderItemInfo(
-        handle,
-        formats: formats,
-        synthesizedFormats: [],
-        virtualReceivers: receivers,
-        suggestedName: await impl.suggestedName(),
-        synthesizedFromURIFormat: null,
-      );
-      res.add(info);
-      if (timeout != null && stopwatch.elapsed > timeout) {
-        break;
-      }
-    }
-    return res;
+    final impl = handle as DataReaderItemHandleImpl;
+    return impl.createVirtualFileReceiver(handle, format: format);
+  }
+
+  @override
+  Future<String?> formatForFileUri(Uri uri) async {
+    return null;
   }
 
   @override

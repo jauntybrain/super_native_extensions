@@ -12,8 +12,7 @@ export 'package:super_native_extensions/raw_clipboard.dart'
 import 'format.dart';
 import 'util.dart';
 import 'writer.dart';
-import 'system_clipboard.dart';
-import 'events.dart';
+import 'writer_data_provider.dart';
 
 /// Represents a single item in the clipboard. The item can have multiple
 /// renditions (each represented as entries in [EncodedData]).
@@ -76,27 +75,39 @@ class DataWriterItem {
   List<FutureOr<EncodedData>> get data => _data;
 }
 
-/// Writes the provided data to the clipboard. The writer can be obtained
-/// using [SystemClipboard.instance], if available, or from a [ClipboardWriteEvent].
-///
 /// Example for using clipboard writer:
 /// ```dart
 /// final item = ClipboardWriterItem();
 /// item.addData(formatHtmlText.encode('<b><i>Html</i></b> Value'));
 /// item.addData(formatPlainText.encodeLazy(() =>
 ///                                   'Plaintext value resolved lazily'));
-/// await SystemClipboard.instance?.write([item]);
+/// await ClipboardWriter.instance.write([item]);
 /// ```
-abstract class ClipboardWriter {
-  /// Writes the provided items to the clipboard.
-  Future<void> write(Iterable<DataWriterItem> items);
+class ClipboardWriter {
+  ClipboardWriter._();
 
-  @Deprecated('Use SystemClipboard.instance instead.')
-  static ClipboardWriter get instance {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard == null) {
-      throw UnsupportedError('Clipboard API is not available on this platform');
+  /// Writes the provided items in system clipboard.
+  Future<void> write(Iterable<DataWriterItem> items) async {
+    final providers = <(raw.DataProvider, DataWriterItem)>[];
+    for (final item in items) {
+      final provider = await item.asDataProvider();
+      if (provider.representations.isNotEmpty) {
+        providers.add((provider, item));
+      }
     }
-    return clipboard;
+    final handles = <raw.DataProviderHandle>[];
+    for (final (provider, writer) in providers) {
+      handles.add(await writer.registerWithDataProvider(provider));
+    }
+    try {
+      await raw.ClipboardWriter.instance.write(handles);
+    } catch (e) {
+      for (final handle in handles) {
+        handle.dispose();
+      }
+      rethrow;
+    }
   }
+
+  static final instance = ClipboardWriter._();
 }

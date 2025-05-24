@@ -10,8 +10,8 @@ import '../reader.dart';
 import '../reader_manager.dart';
 import 'virtual_file.dart';
 
-class $DataReaderHandle {
-  $DataReaderHandle._({
+class DataReaderHandleImpl {
+  DataReaderHandleImpl._({
     required int handle,
     required FinalizableHandle finalizableHandle,
   })  : _handle = handle,
@@ -23,9 +23,9 @@ class $DataReaderHandle {
     _useHandle();
   }
 
-  static $DataReaderHandle deserialize(dynamic handle) {
+  static DataReaderHandleImpl deserialize(dynamic handle) {
     final map = handle as Map;
-    return $DataReaderHandle._(
+    return DataReaderHandleImpl._(
       handle: map["handle"],
       finalizableHandle: map["finalizableHandle"],
     );
@@ -45,10 +45,10 @@ class $DataReaderHandle {
   final FinalizableHandle _finalizableHandle;
 }
 
-class $DataReaderItemHandle {
-  $DataReaderItemHandle._({
+class DataReaderItemHandleImpl {
+  DataReaderItemHandleImpl._({
     required int itemHandle,
-    required $DataReaderHandle reader,
+    required DataReaderHandleImpl reader,
   })  : _itemHandle = itemHandle,
         _reader = reader;
 
@@ -56,7 +56,7 @@ class $DataReaderItemHandle {
   int get _readerHandle => _reader._handle;
 
   // keep reader alive otherwise finalizable handle may dispose it
-  final $DataReaderHandle _reader;
+  final DataReaderHandleImpl _reader;
 }
 
 class ReaderManagerImpl extends ReaderManager {
@@ -73,7 +73,8 @@ class ReaderManagerImpl extends ReaderManager {
   }
 
   @override
-  Future<List<$DataReaderItemHandle>> getItems(DataReaderHandle reader) async {
+  Future<List<DataReaderItemHandleImpl>> getItems(
+      DataReaderHandle reader) async {
     final handles =
         await _channel.invokeMethod("getItems", reader._handle) as List<int>;
     return handles
@@ -91,6 +92,34 @@ class ReaderManagerImpl extends ReaderManager {
       "readerHandle": handle._readerHandle,
     }) as List;
     return formats.cast<String>();
+  }
+
+  @override
+  Future<bool> itemFormatIsSynthesized(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) {
+    if (handle._reader._disposed) {
+      throw StateError("Attempting to query item status from disposed reader.");
+    }
+    return _channel.invokeMethod("itemFormatIsSynthesized", {
+      "itemHandle": handle._itemHandle,
+      "readerHandle": handle._readerHandle,
+      "format": format,
+    });
+  }
+
+  @override
+  Future<String?> getItemSuggestedName(DataReaderItemHandle handle) async {
+    if (handle._reader._disposed) {
+      throw StateError(
+          "Attempting to get suggested name from disposed reader.");
+    }
+    final name = await _channel.invokeMethod("getItemSuggestedName", {
+      "itemHandle": handle._itemHandle,
+      "readerHandle": handle._readerHandle,
+    }) as String?;
+    return name;
   }
 
   @override
@@ -117,6 +146,73 @@ class ReaderManagerImpl extends ReaderManager {
       completer.completeError(error);
     });
     return (completer.future, progress);
+  }
+
+  Future<bool> canCopyVirtualFile(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) async {
+    if (handle._reader._disposed) {
+      throw StateError(
+          "Attempting to query virtual file from disposed reader.");
+    }
+    return await _channel.invokeMethod("canCopyVirtualFile", {
+      "itemHandle": handle._itemHandle,
+      "readerHandle": handle._readerHandle,
+      'format': format,
+    });
+  }
+
+  Future<bool> canReadVirtualFile(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) async {
+    if (handle._reader._disposed) {
+      throw StateError(
+          "Attempting to query virtual file from disposed reader.");
+    }
+    return await _channel.invokeMethod("canReadVirtualFile", {
+      "itemHandle": handle._itemHandle,
+      "readerHandle": handle._readerHandle,
+      'format': format,
+    });
+  }
+
+  @override
+  Future<bool> canGetVirtualFile(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) async {
+    return (await canReadVirtualFile(handle, format: format)) ||
+        (await canCopyVirtualFile(handle, format: format));
+  }
+
+  @override
+  Future<VirtualFileReceiver?> createVirtualFileReceiver(
+    DataReaderItemHandle handle, {
+    required String format,
+  }) async {
+    // First try to produce receiver that can receive the file without copying
+    // it first
+    if (await canReadVirtualFile(handle, format: format)) {
+      assert(
+          await canCopyVirtualFile(handle, format: format),
+          'If implementation can read virtual file it must also '
+          'be able to copy virtual file.');
+      return _VirtualFileReceiver(
+        readerManager: this,
+        handle: handle,
+        format: format,
+      );
+    } else if (await canCopyVirtualFile(handle, format: format)) {
+      return _CopyVirtualFileReceiver(
+        readerManager: this,
+        handle: handle,
+        format: format,
+      );
+    } else {
+      return null;
+    }
   }
 
   (Future<VirtualFile>, ReadProgress) virtualFileCreate(
@@ -149,6 +245,11 @@ class ReaderManagerImpl extends ReaderManager {
       completer.completeError(error);
     });
     return (completer.future, progress);
+  }
+
+  @override
+  Future<String?> formatForFileUri(Uri uri) {
+    return _channel.invokeMethod('getFormatForFileUri', uri.toString());
   }
 
   Future<Uint8List?> virtualFileRead({
@@ -224,60 +325,6 @@ class ReaderManagerImpl extends ReaderManager {
   VirtualFile createVirtualFileFromUri(Uri uri) {
     final file = File(uri.toFilePath());
     return VirtualFileFromFile(file: file, onClose: () {});
-  }
-
-  @override
-  Future<List<DataReaderItemInfo>> getItemInfo(
-    Iterable<DataReaderItemHandle> handles, {
-    Duration? timeout,
-  }) async {
-    if (handles.isEmpty) {
-      return [];
-    }
-
-    final reader = handles.first._reader;
-
-    final handleMap =
-        Map.fromEntries(handles.map((e) => MapEntry(e._itemHandle, e)));
-    final res_ = await _channel.invokeMethod('getItemInfo', {
-      'readerHandle': reader._handle,
-      'itemHandles': handles.map((e) => e._itemHandle),
-      'timeoutMillis': timeout?.inMilliseconds,
-    });
-    final list = res_['items'] as List;
-    final res = list.map((e) {
-      final handle = handleMap[e['handle']]!;
-      final readVirtualFormats =
-          (e['readVirtualFileFormats'] as List).cast<String>();
-      final copyVirtualFormats =
-          (e['copyVirtualFileFormats'] as List).cast<String>();
-      final receivers = readVirtualFormats.map<VirtualFileReceiver>((format) {
-        return _VirtualFileReceiver(
-          readerManager: this,
-          handle: handle,
-          format: format,
-        );
-      }).toList(growable: true);
-      for (final format in copyVirtualFormats) {
-        // Prefer read virtual file over copy virtual file.
-        if (!readVirtualFormats.contains(format)) {
-          receivers.add(_CopyVirtualFileReceiver(
-            readerManager: this,
-            handle: handle,
-            format: format,
-          ));
-        }
-      }
-      return DataReaderItemInfo(
-        handle,
-        formats: (e['formats'] as List).cast<String>(),
-        synthesizedFormats: (e['synthesizedFormats'] as List).cast<String>(),
-        virtualReceivers: receivers,
-        suggestedName: e['suggestedName'],
-        synthesizedFromURIFormat: e['fileUriFormat'],
-      );
-    }).toList(growable: false);
-    return res;
   }
 }
 

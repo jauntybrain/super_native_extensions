@@ -80,7 +80,6 @@ impl DropSource {
     }
 }
 
-#[allow(non_snake_case)]
 impl IDropSource_Impl for DropSource {
     fn QueryContinueDrag(
         &self,
@@ -94,7 +93,7 @@ impl IDropSource_Impl for DropSource {
             DRAGDROP_S_DROP
         } else {
             let mut cursor_pos = POINT::default();
-            unsafe { GetCursorPos(&mut cursor_pos as *mut _).ok_log() };
+            unsafe { GetCursorPos(&mut cursor_pos as *mut _) };
             if let Some(context) = self.platform_context.upgrade() {
                 if let Some(delegate) = context.delegate.upgrade() {
                     let location = Point {

@@ -2,7 +2,8 @@ use std::{fs::OpenOptions, io::Write, mem::size_of, path::Path, ptr::null_mut};
 
 use once_cell::sync::Lazy;
 use windows::{
-    core::{s, ComInterface, GUID, HRESULT, HSTRING},
+    core::{ComInterface, GUID, HRESULT, HSTRING},
+    s,
     Win32::{
         Foundation::{E_UNEXPECTED, HANDLE, HWND, S_OK},
         Graphics::Gdi::{
@@ -96,7 +97,7 @@ pub fn image_data_to_hbitmap(image: &ImageData) -> NativeExtensionsResult<HBITMA
             biHeight: image.height,
             biPlanes: 1,
             biBitCount: 32,
-            biCompression: BI_RGB.0,
+            biCompression: BI_RGB.0 as u32,
             biSizeImage: (image.width * image.height * 4) as u32,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,
@@ -186,12 +187,10 @@ impl DpiFunctions {
             let user_32 = LoadLibraryA(s!("user32")).unwrap();
             let shlib = LoadLibraryA(s!("Shcore.dll")).unwrap();
             Self {
-                #[allow(clippy::missing_transmute_annotations)]
                 get_dpi_for_window: std::mem::transmute(GetProcAddress(
                     user_32,
                     s!("GetDpiForWindow"),
                 )),
-                #[allow(clippy::missing_transmute_annotations)]
                 get_dpi_for_monitor: std::mem::transmute(GetProcAddress(
                     shlib,
                     s!("GetDpiForMonitor"),

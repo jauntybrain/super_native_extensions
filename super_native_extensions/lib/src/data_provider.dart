@@ -15,7 +15,7 @@ class DataProvider {
 
   /// Registers this source with native code. The source data will be kept alive
   /// until handle is disposed.
-  FutureOr<DataProviderHandle> register() {
+  Future<DataProviderHandle> register() {
     return DataProviderManager.instance.registerDataProvider(this);
   }
 

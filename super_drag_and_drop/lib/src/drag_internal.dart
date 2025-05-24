@@ -123,23 +123,6 @@ class _DragContextDelegate implements raw.DragContextDelegate {
   }
 }
 
-class _Drag implements Drag {
-  bool _ended = false;
-
-  @override
-  void cancel() {
-    _ended = true;
-  }
-
-  @override
-  void end(DragEndDetails details) {
-    _ended = true;
-  }
-
-  @override
-  void update(DragUpdateDetails details) {}
-}
-
 abstract class _DragDetector extends StatelessWidget {
   final Widget child;
   final DragConfigurationProvider dragConfiguration;
@@ -170,21 +153,25 @@ abstract class _DragDetector extends StatelessWidget {
             final event = PointerRemovedEvent(
                 pointer: pointer, kind: PointerDeviceKind.mouse);
 
-            RendererBinding.instance.mouseTracker
-                .updateWithEvent(event, HitTestResult());
+            // TODO(knopp): Remove this hack when stable catches up with main
+            try {
+              RendererBinding.instance.mouseTracker
+                  .updateWithEvent(event, (() => HitTestResult()) as dynamic);
+            } catch (_) {
+              RendererBinding.instance.mouseTracker
+                  .updateWithEvent(event, (HitTestResult()) as dynamic);
+            }
           }
         });
       }
-      final drag = _Drag();
       _maybeStartDragWithSession(
         dragContext,
         buildContext,
         position,
         session,
         devicePixelRatio,
-        drag,
       );
-      return drag;
+      return null;
     } else {
       return null;
     }
@@ -196,14 +183,8 @@ abstract class _DragDetector extends StatelessWidget {
     Offset position,
     raw.DragSession session,
     double devicePixelRatio,
-    _Drag drag,
   ) async {
     final dragConfiguration = await this.dragConfiguration(position, session);
-    // User ended the drag gesture before the data is available.
-    if (drag._ended) {
-      _dragContext!.cancelSession(session);
-      return;
-    }
     if (dragConfiguration != null) {
       final rawConfiguration =
           await dragConfiguration.intoRaw(devicePixelRatio);
@@ -223,43 +204,6 @@ abstract class _DragDetector extends StatelessWidget {
   }
 }
 
-/// Determine the appropriate hit slop pixels based on the [kind] of pointer.
-double _computeHitSlop(
-  PointerDeviceKind kind,
-  DeviceGestureSettings? settings,
-) {
-  switch (kind) {
-    case PointerDeviceKind.mouse:
-      // Normally this would be kPrecisePointerHitSlop (1), but for drag & drop some
-      // extra slop is helpful to prevent accidental dragging, especially when using a tablet.
-      return 4.0;
-    case PointerDeviceKind.stylus:
-    case PointerDeviceKind.invertedStylus:
-    case PointerDeviceKind.unknown:
-    case PointerDeviceKind.touch:
-    case PointerDeviceKind.trackpad:
-      return settings?.touchSlop ?? kTouchSlop;
-  }
-}
-
-class _ImmediatePointerState extends MultiDragPointerState {
-  _ImmediatePointerState(
-      super.initialPosition, super.kind, super.gestureSettings);
-
-  @override
-  void checkForResolutionAfterMove() {
-    assert(pendingDelta != null);
-    if (pendingDelta!.distance > _computeHitSlop(kind, gestureSettings)) {
-      resolve(GestureDisposition.accepted);
-    }
-  }
-
-  @override
-  void accepted(GestureMultiDragStartCallback starter) {
-    starter(initialPosition);
-  }
-}
-
 class _ImmediateMultiDragGestureRecognizer
     extends ImmediateMultiDragGestureRecognizer {
   int? lastPointer;
@@ -269,11 +213,6 @@ class _ImmediateMultiDragGestureRecognizer
   _ImmediateMultiDragGestureRecognizer({
     required this.isLocationDraggable,
   });
-
-  @override
-  MultiDragPointerState createNewPointerState(PointerDownEvent event) {
-    return _ImmediatePointerState(event.position, event.kind, gestureSettings);
-  }
 
   @override
   void acceptGesture(int pointer) {

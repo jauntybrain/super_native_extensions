@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:irondash_message_channel/irondash_message_channel.dart';
 
 import 'context.dart';
@@ -13,9 +11,6 @@ class ClipboardReaderImpl extends ClipboardReader {
     final handle = await _channel.invokeMethod('newClipboardReader');
     return DataReader(handle: DataReaderHandle.deserialize(handle));
   }
-
-  @override
-  bool get available => true;
 
   ClipboardReaderImpl();
 

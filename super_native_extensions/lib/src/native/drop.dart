@@ -73,7 +73,7 @@ class DropEventImpl extends DropEvent {
     DataReader? getReader() {
       final reader = map['reader'];
       return reader != null
-          ? DataReader(handle: $DataReaderHandle.deserialize(reader))
+          ? DataReader(handle: DataReaderHandleImpl.deserialize(reader))
           : null;
     }
 

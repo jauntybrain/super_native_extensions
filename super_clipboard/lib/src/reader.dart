@@ -4,7 +4,6 @@ import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart';
 import 'package:super_native_extensions/raw_clipboard.dart' as raw;
 
-import 'system_clipboard.dart';
 import 'format.dart';
 import 'reader_internal.dart';
 import 'standard_formats.dart';
@@ -135,9 +134,8 @@ abstract class DataReader {
   /// If this reader is backed by raw DataReaderItem returns it.
   raw.DataReaderItem? get rawReader => null;
 
-  /// Creates data reader from provided item info.
-  static DataReader forItemInfo(raw.DataReaderItemInfo info) =>
-      ItemDataReader.fromItemInfo(info);
+  static Future<DataReader> forItem(raw.DataReaderItem item) async =>
+      ItemDataReader.fromItem(item);
 }
 
 abstract class ClipboardDataReader extends DataReader {
@@ -147,24 +145,25 @@ abstract class ClipboardDataReader extends DataReader {
   /// is not available or the data is virtual (macOS and Windows).
   Future<T?> readValue<T extends Object>(ValueFormat<T> format);
 
-  static ClipboardDataReader forItemInfo(raw.DataReaderItemInfo item) =>
-      ItemDataReader.fromItemInfo(item);
+  static Future<ClipboardDataReader> forItem(raw.DataReaderItem item) async =>
+      ItemDataReader.fromItem(item);
 }
 
 /// Clipboard reader exposes contents of the clipboard.
 class ClipboardReader extends ClipboardDataReader {
-  ClipboardReader(this.items);
+  ClipboardReader._(this.items);
 
   /// Individual items of this clipboard reader.
   final List<ClipboardDataReader> items;
 
-  @Deprecated('Use SystemClipboard.instance?.read() instead.')
   static Future<ClipboardReader> readClipboard() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard == null) {
-      throw UnsupportedError('Clipboard API is not available on this platform');
+    final reader = await raw.ClipboardReader.instance.newClipboardReader();
+    final readerItems = await reader.getItems();
+    final items = <ClipboardDataReader>[];
+    for (final item in readerItems) {
+      items.add(await ClipboardDataReader.forItem(item));
     }
-    return clipboard.read();
+    return ClipboardReader._(items);
   }
 
   @override

@@ -1,5 +1,4 @@
 mod clipboard_async;
-mod clipboard_events;
 mod common;
 mod data_provider;
 mod drag;
@@ -11,7 +10,6 @@ mod menu;
 mod reader;
 mod signal;
 
-pub use clipboard_events::*;
 pub use data_provider::*;
 pub use drag::*;
 pub use drop::*;

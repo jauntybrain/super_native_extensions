@@ -9,7 +9,6 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Point;
-import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.DragEvent;
@@ -56,7 +55,7 @@ public class DragDropHelper {
         }
     }
 
-    native void updateLastTouchPoint(ViewParent rootView, int x, int y);
+    native void updateLastTouchPoint(ViewParent rootView, MotionEvent event);
 
     void startDrag(View view, long dragSessionId, ClipData clipData, Bitmap bitmap,
                    int touchPointX, int touchPointY, int lastTouchEventX, int lastTouchEventY) {
@@ -68,23 +67,21 @@ public class DragDropHelper {
             while (parent.getParent() != null) {
                 parent = parent.getParent();
             }
-            int[] viewLocation = new int[2];
+            int viewLocation[] = new int[2];
             view.getLocationOnScreen(viewLocation);
-            // Override the last touch point which which will be the return position
+            MotionEvent event = MotionEvent.obtain(SystemClock.uptimeMillis(), SystemClock.uptimeMillis(),
+                                                   MotionEvent.ACTION_MOVE,
+                                                   lastTouchEventX + viewLocation[0],
+                                                   lastTouchEventY + viewLocation[1],
+                                                   0);
+            event.setSource(InputDevice.SOURCE_CLASS_POINTER);
+            // Simulate touch event before starting drag which will be the return position
             // on failed drop
-            updateLastTouchPoint(parent, lastTouchEventX + viewLocation[0], lastTouchEventY + viewLocation[1]);
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                view.startDragAndDrop(clipData,
-                        new DragShadowBuilder(bitmap, new Point(touchPointX, touchPointY)), new SessionId(dragSessionId),
-                        flags
-                );
-            } else {
-                view.startDrag(clipData,
-                        new DragShadowBuilder(bitmap, new Point(touchPointX, touchPointY)), new SessionId(dragSessionId),
-                        flags
-                );
-            }
+            updateLastTouchPoint(parent, event);
+            view.startDrag(clipData,
+                    new DragShadowBuilder(bitmap, new Point(touchPointX, touchPointY)), new SessionId(dragSessionId),
+                    flags
+            );
         }
     }
 

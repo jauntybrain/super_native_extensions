@@ -85,19 +85,14 @@ class OverlayLayoutDelegate extends MultiChildLayoutDelegate {
     return ui.lerpDouble(maxFactor, minFactor, ratio)!;
   }
 
-  Rect _computePrimaryItemRect({
-    required Rect bounds,
-    required Rect? menuPreviewRect,
-    required double liftFactor,
-  }) {
+  Rect _computePrimaryItemRect(Rect? menuPreviewRect, double liftFactor) {
     final inflateFactor = 1.0 + (liftFactor - 1.0) * dragState.liftFactor;
     var rect = primaryItem.liftRect.inflateBy(inflateFactor);
 
     // If there is no custom menu preview use the size from lift rect.
     // This is similar behavior to iOS.
     if (!hasCustomMenuPreview && menuPreviewRect != null) {
-      menuPreviewRect =
-          menuPreviewRect.inflateBy(inflateFactor).fitIntoRect(bounds);
+      menuPreviewRect = menuPreviewRect.inflateBy(inflateFactor);
     }
 
     if (hasChild(menuPreviewId) && dragState.menuFactor > 0) {
@@ -172,9 +167,8 @@ class OverlayLayoutDelegate extends MultiChildLayoutDelegate {
     }
 
     final primaryItemRect = _computePrimaryItemRect(
-      bounds: bounds,
-      menuPreviewRect: menuPreviewRect,
-      liftFactor: _inflateFactorForSize(size),
+      menuPreviewRect,
+      _inflateFactorForSize(size),
     );
     _layoutChild(primaryItem.liftChildId, primaryItemRect);
     _layoutChild(primaryItem.dragChildId, primaryItemRect);

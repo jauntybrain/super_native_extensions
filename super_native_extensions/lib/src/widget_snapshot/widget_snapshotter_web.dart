@@ -1,10 +1,7 @@
-import 'dart:js_interop' as js;
-import 'dart:js_interop_unsafe';
+import 'dart:js' as js;
 
-import 'package:flutter/foundation.dart';
-
-final isCanvasKit = js.globalContext['flutterCanvasKit'] != null;
+final isCanvasKit = js.context['flutterCanvasKit'] != null;
 
 bool snapshotToImageSupportedInternal() {
-  return isCanvasKit || kIsWasm;
+  return isCanvasKit;
 }

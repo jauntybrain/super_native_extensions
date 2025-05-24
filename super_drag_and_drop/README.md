@@ -194,7 +194,7 @@ class MyDropRegion extends StatelessWidget {
 }
 ```
 
-On desktop platforms full drag data is available in `onDropOver`. On mobile and web platforms, data is only available when the drop is accepted and in `onDropOver` you can only query data format.
+One desktop platforms full drag data is available in `onDropOver`. On mobile and web platforms, data is only available when the drop is accepted and in `onDropOver` you can only query data format.
 
 Local data is always available.
 

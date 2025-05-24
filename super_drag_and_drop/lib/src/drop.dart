@@ -23,14 +23,8 @@ abstract class DropItem with Diagnosticable {
   Object? get localData;
 
   /// [DataReader] that can be used to access drag data for this item.
-  /// `dataReader` is always available in `onPerformDrop` event, but may be `null`
-  /// during the `onDropOver` event in following cases:
-  /// - on mobile and web, `dataReader` is always `null` during `onDropOver`.
-  ///   For security reasons the data is only available after user actually
-  ///   performed the drop.
-  /// - on desktop `dataReader` is gradually populated during `onDropOver` event.
-  ///   On some platforms clipboard access can get slow with large amount of items,
-  ///   and rather than blocking main thread the items are populated asynchronously.
+  /// On some platforms (mobile, web) the reader is only available after
+  /// user actually performed the drop.
   DataReader? get dataReader;
 
   /// Returns list of platform specific format identifier for this item.

@@ -3,19 +3,11 @@
 #![allow(clippy::single_match)]
 #![allow(clippy::type_complexity)]
 #![allow(unknown_lints)]
-// https://github.com/rust-lang/rust-clippy/issues/11076
-#![allow(clippy::arc_with_non_send_sync)]
-// TODO(knopp): Fine grained way to prevent dead code warnings in code that is not used on all platforms.
-#![allow(dead_code)]
-// TODO(knopp): Remove once supported on stable
-#![allow(clippy::needless_lifetimes)]
-// TODO(knopp): False positive in 1.83.0.
-#![allow(clippy::missing_const_for_thread_local)]
+#![allow(clippy::arc_with_non_send_sync)] // https://github.com/rust-lang/rust-clippy/issues/11076
 
 use std::ffi::c_void;
 
 use ::log::debug;
-use clipboard_events_manager::GetClipboardEventManager;
 use clipboard_reader::GetClipboardReader;
 use clipboard_writer::GetClipboardWriter;
 use context::Context;
@@ -31,7 +23,6 @@ use reader_manager::GetDataReaderManager;
 
 mod api_model;
 mod blur;
-mod clipboard_events_manager;
 mod clipboard_reader;
 mod clipboard_writer;
 mod context;
@@ -100,7 +91,6 @@ impl DataTransferPlugin {
         context.keyboard_map_manager();
         context.hot_key_manager();
         context.menu_manager();
-        context.clipboard_event_manager();
         DataTransferPlugin { _context: context }
     }
 }
@@ -137,7 +127,6 @@ pub extern "C" fn super_native_extensions_init() {
 #[cfg(target_os = "android")]
 mod android {
 
-    use irondash_run_loop::RunLoop;
     use once_cell::sync::OnceCell;
 
     use crate::init;
@@ -161,12 +150,6 @@ mod android {
     ) {
         use ::log::Level;
         use android_logger::Config;
-
-        // This is to ensure that engine context is not used for sending things
-        // to main thread. EngineContext main thread sender does not work properly
-        // with RunLoop::poll_once, which is used during clipboard access.
-        // Without this clipboard access may deadlock.
-        RunLoop::set_main_thread();
 
         android_logger::init_once(
             Config::default()

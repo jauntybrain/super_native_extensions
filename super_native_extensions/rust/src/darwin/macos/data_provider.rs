@@ -4,27 +4,32 @@ use std::{
     fs::File,
     io::Write,
     mem::ManuallyDrop,
-    os::unix::prelude::{FromRawFd, IntoRawFd},
+    os::{
+        raw::c_void,
+        unix::prelude::{FromRawFd, IntoRawFd},
+    },
     path::PathBuf,
     rc::{Rc, Weak},
     sync::{Arc, Mutex},
 };
 
-use block2::{Block, RcBlock};
+use block::{Block, ConcreteBlock, RcBlock};
+use cocoa::{
+    appkit::NSPasteboard,
+    base::{id, nil, YES},
+    foundation::{NSArray, NSUInteger},
+};
+
 use irondash_message_channel::{value_darwin::ValueObjcConversion, IsolateId, Late};
 use irondash_run_loop::{platform::PollSession, RunLoop};
-use objc2::{
-    declare_class, extern_class, extern_methods, msg_send_id,
-    mutability::{self, InteriorMutable},
-    rc::{Allocated, Id},
-    runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject},
-    ClassType, DeclaredClass,
+use objc::{
+    class,
+    declare::ClassDecl,
+    msg_send,
+    rc::{autoreleasepool, StrongPtr},
+    runtime::{Class, Object, Protocol, Sel},
+    sel, sel_impl,
 };
-use objc2_app_kit::{
-    NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSPasteboard, NSPasteboardType,
-    NSPasteboardWriting, NSPasteboardWritingOptions,
-};
-use objc2_foundation::{NSArray, NSError, NSProgress, NSProgressKindFile, NSString, NSURL};
 use once_cell::sync::Lazy;
 
 use crate::{
@@ -34,7 +39,7 @@ use crate::{
     },
     error::NativeExtensionsResult,
     log::OkLog,
-    platform_impl::platform::common::{path_from_url, to_nserror},
+    platform_impl::platform::common::{from_nsstring, path_from_url, to_nserror, to_nsstring},
     value_promise::ValuePromiseResult,
 };
 
@@ -66,7 +71,7 @@ pub struct PlatformDataProvider {
 }
 
 thread_local! {
-    static WAITING_FOR_PASTEBOARD_DATA: Cell<bool> = const { Cell::new(false) };
+    static WAITING_FOR_PASTEBOARD_DATA: Cell<bool> = Cell::new(false);
 }
 
 impl PlatformDataProvider {
@@ -102,7 +107,7 @@ impl PlatformDataProvider {
         handle: Arc<DataProviderHandle>,
         retain_handle: bool,
         is_for_dragging: bool,
-    ) -> Id<NSObject> {
+    ) -> StrongPtr {
         let state = Rc::new(ItemState {
             data_provider: self.weak_self.clone(),
             data_provider_handle: Arc::downgrade(&handle),
@@ -120,19 +125,21 @@ impl PlatformDataProvider {
     pub async fn write_to_clipboard(
         providers: Vec<(Rc<PlatformDataProvider>, Arc<DataProviderHandle>)>,
     ) -> NativeExtensionsResult<()> {
-        let items: Vec<_> = providers
-            .into_iter()
-            .map(|p| p.0.create_writer(p.1, true, false))
-            .collect();
-        let array = NSArray::from_vec(items);
-        let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
-        unsafe { pasteboard.clearContents() };
-        unsafe { pasteboard.writeObjects(&Id::cast(array)) };
+        autoreleasepool(|| unsafe {
+            let items: Vec<_> = providers
+                .into_iter()
+                .map(|p| p.0.create_writer(p.1, true, false).autorelease())
+                .collect();
+            let array = NSArray::arrayWithObjects(nil, &items);
+            let pasteboard = NSPasteboard::generalPasteboard(nil);
+            NSPasteboard::clearContents(pasteboard);
+            NSPasteboard::writeObjects(pasteboard, array);
+        });
         Ok(())
     }
 }
 
-pub struct ItemState {
+struct ItemState {
     data_provider: Weak<PlatformDataProvider>,
     data_provider_handle: std::sync::Weak<DataProviderHandle>,
     _retained_data_provider_handle: Option<Arc<DataProviderHandle>>,
@@ -146,30 +153,30 @@ struct VirtualFileInfo {
 }
 
 impl ItemState {
-    fn create_item(self: Rc<Self>) -> Id<NSObject> {
-        let writer = SNEPasteboardWriter::alloc();
-        let writer = writer.set_ivars(Ivars {
-            item_state: self.clone(),
-        });
-        let writer: Id<SNEPasteboardWriter> = unsafe { msg_send_id![super(writer), init] };
+    fn create_item(self: Rc<Self>) -> StrongPtr {
+        let item = unsafe {
+            let item: id = msg_send![*PASTEBOARD_WRITER_CLASS, new];
+            (*item).set_ivar("sneState", Rc::into_raw(self.clone()) as *mut c_void);
+            StrongPtr::new(item)
+        };
 
         let info = self.virtual_file_info();
-
         match info {
-            Some(info) => unsafe {
-                let provider = SNEForwardingFilePromiseProvider::init(
-                    SNEForwardingFilePromiseProvider::alloc(),
-                );
-                provider.setFileType(&NSString::from_str(&info.format));
-                provider.setDelegate(Some(&Id::cast(writer.clone())));
-                provider.setWritingDelegate(Some(&Id::cast(writer)));
-                Id::cast(provider)
-            },
-            None => unsafe { Id::cast(writer) },
+            Some(info) => {
+                unsafe {
+                    let provider: id = msg_send![class!(SNEForwardingFilePromiseProvider), new];
+                    let () = msg_send![provider, setFileType: *to_nsstring(&info.format)];
+                    let () = msg_send![provider, setDelegate: *item];
+                    let () = msg_send![provider, setWritingDelegate: *item]; // this one is strong reference
+                    StrongPtr::new(provider)
+                }
+            }
+            None => item,
         }
     }
 
     fn virtual_file_info(self: &Rc<Self>) -> Option<VirtualFileInfo> {
+        Class::get("NSFilePromiseProvider")?;
         self.data_provider.upgrade().and_then(|data_provider| {
             let data = &data_provider.data;
             data.representations.iter().find_map(|item| match item {
@@ -186,7 +193,7 @@ impl ItemState {
         })
     }
 
-    fn writable_types(&self) -> Id<NSArray<NSPasteboardType>> {
+    fn writable_types(&self) -> id {
         match self.data_provider.upgrade() {
             Some(data_provider) => {
                 let data = &data_provider.data;
@@ -195,10 +202,10 @@ impl ItemState {
                     .iter()
                     .filter_map(|d| match d {
                         DataRepresentation::Simple { format, data: _ } => {
-                            Some(NSString::from_str(format))
+                            Some(to_nsstring(format).autorelease())
                         }
                         DataRepresentation::Lazy { format, id: _ } => {
-                            Some(NSString::from_str(format))
+                            Some(to_nsstring(format).autorelease())
                         }
                         _ => None,
                     })
@@ -206,25 +213,34 @@ impl ItemState {
                 // Dragging will fail with empty pasteboard. But it is a valid
                 // use case in case we have only local data
                 if types.is_empty() && self.is_for_dragging {
-                    NSArray::from_vec(vec![NSString::from_str("dev.nativeshell.placeholder-item")])
+                    unsafe {
+                        NSArray::arrayWithObject(
+                            nil,
+                            *to_nsstring("dev.nativeshell.placeholder-item"),
+                        )
+                    }
                 } else {
-                    NSArray::from_vec(types)
+                    unsafe { NSArray::arrayWithObjects(nil, &types) }
                 }
             }
-            None => unsafe { NSArray::array() },
+            None => nil,
         }
     }
 
-    fn object_for_type(&self, pasteboard_type: &NSPasteboardType) -> Option<Id<NSObject>> {
+    fn object_for_type(&self, pasteboard_type: id) -> id {
         match self.data_provider.upgrade() {
             Some(data_provider) => {
-                let ty = pasteboard_type.to_string();
+                let ty = unsafe { from_nsstring(pasteboard_type) };
                 let data = &data_provider.data;
                 for repr in &data.representations {
                     match repr {
                         DataRepresentation::Simple { format, data } => {
                             if &ty == format {
-                                return data.to_objc().ok_log().flatten();
+                                return data
+                                    .to_objc()
+                                    .ok_log()
+                                    .map(|a| a.autorelease())
+                                    .unwrap_or(nil);
                             }
                         }
                         DataRepresentation::Lazy { format, id } => {
@@ -237,10 +253,14 @@ impl ItemState {
                                         if let Some(result) = promise.try_take() {
                                             match result {
                                                 ValuePromiseResult::Ok { value } => {
-                                                    return value.to_objc().ok_log().flatten()
+                                                    return value
+                                                        .to_objc()
+                                                        .ok_log()
+                                                        .map(|a| a.autorelease())
+                                                        .unwrap_or(nil);
                                                 }
                                                 ValuePromiseResult::Cancelled => {
-                                                    return None;
+                                                    return nil;
                                                 }
                                             }
                                         }
@@ -258,40 +278,42 @@ impl ItemState {
                         _ => {}
                     }
                 }
-                None
+                nil
             }
-            None => None,
+            None => nil,
         }
     }
 
-    fn file_promise_file_name_for_type(self: &Rc<Self>, _file_type: &NSString) -> Id<NSString> {
+    fn file_promise_file_name_for_type(self: &Rc<Self>, _file_type: id) -> id {
         match self.data_provider.upgrade() {
             Some(data_provider) => {
                 let data = &data_provider.data;
                 data.suggested_name
                     .as_ref()
-                    .map(|name| NSString::from_str(name))
-                    .unwrap_or(unsafe { NSString::string() })
+                    .map(|name| to_nsstring(name).autorelease())
+                    .unwrap_or(nil)
             }
-            None => unsafe { NSString::string() },
+            None => nil,
         }
     }
 
-    fn progress_for_url(url: &NSURL) -> Id<NSProgress> {
+    fn progress_for_url(url: id) -> StrongPtr {
         unsafe {
-            let progress = NSProgress::initWithParent_userInfo(NSProgress::alloc(), None, None);
-            progress.setKind(Some(NSProgressKindFile));
-            progress.setFileURL(Some(url));
-            progress.setCancellable(true);
-            progress.publish();
+            let progress = StrongPtr::retain(
+                msg_send![class!(NSProgress), discreteProgressWithTotalUnitCount: 1000u64],
+            );
+            let () = msg_send![*progress, setKind:*to_nsstring("NSProgressKindFile")];
+            let () = msg_send![*progress, setFileURL: url];
+            let () = msg_send![*progress, setCancellable: YES];
+            let () = msg_send![*progress, publish];
             progress
         }
     }
 
     fn file_promise_do_write(
         self: &Rc<Self>,
-        url: &NSURL,
-        completion_fn: Box<dyn FnOnce(Option<Id<NSError>>)>,
+        url: id,
+        completion_fn: Box<dyn FnOnce(id)>,
         info: VirtualFileInfo,
         data_provider: Rc<PlatformDataProvider>,
         delegate: Rc<dyn PlatformDataProviderDelegate>,
@@ -305,7 +327,7 @@ impl ItemState {
             Ok(file) => file,
             Err(err) => {
                 let error = to_nserror("super_dnd", 0, &err.to_string());
-                completion_fn(Some(error));
+                completion_fn(*error);
                 return;
             }
         };
@@ -320,42 +342,41 @@ impl ItemState {
             descriptor,
             Box::new(|_| {}),
             Box::new(move |cnt| {
-                let completed = (cnt * 1000.0).round() as i64;
-                unsafe { progress_clone.setCompletedUnitCount(completed) };
+                let completed = (cnt * 1000.0).round() as u64;
+                let () = unsafe { msg_send![*progress_clone, setCompletedUnitCount: completed] };
             }),
             Box::new(move |result| {
                 let _handle = data_provider_handle;
-                unsafe { progress_clone2.unpublish() };
+                unsafe {
+                    let () = msg_send![*progress_clone2, unpublish];
+                }
                 match result {
-                    VirtualFileResult::Done => completion_fn(None),
+                    VirtualFileResult::Done => completion_fn(nil),
                     VirtualFileResult::Error { message } => {
                         let error = to_nserror("super_dnd", 0, &message);
-                        completion_fn(Some(error));
+                        completion_fn(*error);
                     }
                     VirtualFileResult::Cancelled => {
                         let error = to_nserror("super_dnd", 0, "Cancelled");
-                        completion_fn(Some(error));
+                        completion_fn(*error);
                     }
                 }
             }),
         );
         self.virtual_files.borrow_mut().push(notifier.clone());
         let notifier = Arc::downgrade(&notifier);
-        let cancellation_handler = RcBlock::new(move || {
+        let cancellation_handler = ConcreteBlock::new(move || {
             if let Some(notifier) = notifier.upgrade() {
                 notifier.dispose();
             }
         });
+        let cancellation_handler = cancellation_handler.copy();
         unsafe {
-            progress.setCancellationHandler(Some(&cancellation_handler));
+            let () = msg_send![*progress, setCancellationHandler:&*cancellation_handler];
         }
     }
 
-    fn file_promise_write_to_url(
-        self: &Rc<Self>,
-        url: &NSURL,
-        completion_fn: Box<dyn FnOnce(Option<Id<NSError>>)>,
-    ) {
+    fn file_promise_write_to_url(self: &Rc<Self>, url: id, completion_fn: Box<dyn FnOnce(id)>) {
         let info = self.virtual_file_info();
         let data_provider = self.data_provider.upgrade();
         let delegate = data_provider.as_ref().and_then(|c| c.delegate.upgrade());
@@ -374,117 +395,118 @@ impl ItemState {
             }
             _ => {
                 let error = to_nserror("super_dnd", 0, "data not found");
-                completion_fn(Some(error));
+                completion_fn(*error);
             }
         }
     }
 }
 
-struct Ivars {
-    item_state: Rc<ItemState>,
+fn item_state(this: &Object) -> Rc<ItemState> {
+    unsafe {
+        let state_ptr = {
+            let state_ptr: *mut c_void = *this.get_ivar("sneState");
+            state_ptr as *const ItemState
+        };
+        let ptr = Rc::from_raw(state_ptr);
+        let res = ptr.clone();
+        let _ = ManuallyDrop::new(ptr);
+        res
+    }
 }
 
-declare_class!(
-    struct SNEPasteboardWriter;
+extern "C" fn writable_types_for_pasteboard(this: &Object, _sel: Sel, _pasteboard: id) -> id {
+    let state = item_state(this);
+    state.writable_types()
+}
 
-    unsafe impl ClassType for SNEPasteboardWriter {
-        type Super = NSObject;
-        type Mutability = mutability::InteriorMutable;
-        const NAME: &'static str = "SNEPasteboardWriter";
+extern "C" fn writing_options_for_type(
+    _this: &Object,
+    _sel: Sel,
+    _type: id,
+    _pastaboard: id,
+) -> NSUInteger {
+    1 << 9 // NSPasteboardWritingPromised
+}
+
+extern "C" fn pasteboard_property_list_for_type(this: &Object, _sel: Sel, ty: id) -> id {
+    let state = item_state(this);
+    state.object_for_type(ty)
+}
+
+extern "C" fn file_promise_file_name_for_type(
+    this: &Object,
+    _sel: Sel,
+    _provider: id,
+    file_type: id,
+) -> id {
+    let state = item_state(this);
+    state.file_promise_file_name_for_type(file_type)
+}
+
+extern "C" fn file_promise_write_to_url(
+    this: &Object,
+    _sel: Sel,
+    _provider: id,
+    url: id,
+    completion_block: id,
+) {
+    let completion_block = unsafe { &mut *(completion_block as *mut Block<(id,), ()>) };
+    let completion_block = unsafe { RcBlock::copy(completion_block) };
+    let completion_fn = move |error: id| {
+        unsafe { completion_block.call((error,)) };
+    };
+    let state = item_state(this);
+    state.file_promise_write_to_url(url, Box::new(completion_fn));
+}
+
+extern "C" fn dealloc(this: &Object, _sel: Sel) {
+    unsafe {
+        let state_ptr = {
+            let state_ptr: *mut c_void = *this.get_ivar("sneState");
+            state_ptr as *const ItemState
+        };
+        Rc::from_raw(state_ptr);
+
+        let () = msg_send![super(this, *SUPERCLASS), dealloc];
     }
+}
 
-    impl DeclaredClass for SNEPasteboardWriter {
-        type Ivars = Ivars;
+static SUPERCLASS: Lazy<&'static Class> = Lazy::new(|| class!(NSObject));
+
+static PASTEBOARD_WRITER_CLASS: Lazy<&'static Class> = Lazy::new(|| unsafe {
+    let mut decl = ClassDecl::new("SNEPasteboardWriter", *SUPERCLASS).unwrap();
+    decl.add_ivar::<*mut c_void>("sneState");
+    if let Some(protocol) = Protocol::get("NSPasteboardWriting") {
+        decl.add_protocol(protocol);
     }
-
-    unsafe impl NSObjectProtocol for SNEPasteboardWriter {}
-
-    unsafe impl NSPasteboardWriting for SNEPasteboardWriter {
-        #[method_id(writableTypesForPasteboard:)]
-        #[allow(non_snake_case)]
-        unsafe fn writableTypesForPasteboard(
-            &self,
-            _pasteboard: &NSPasteboard,
-        ) -> Id<NSArray<NSPasteboardType>> {
-            self.ivars().item_state.writable_types()
-        }
-
-        #[method(writingOptionsForType:pasteboard:)]
-        #[allow(non_snake_case)]
-        unsafe fn writingOptionsForType_pasteboard(
-            &self,
-            r#_type: &NSPasteboardType,
-            _pasteboard: &NSPasteboard,
-        ) -> NSPasteboardWritingOptions {
-            NSPasteboardWritingOptions::NSPasteboardWritingPromised
-        }
-
-        #[method_id(pasteboardPropertyListForType:)]
-        #[allow(non_snake_case)]
-        unsafe fn pasteboardPropertyListForType(
-            &self,
-            r#type: &NSPasteboardType,
-        ) -> Option<Id<AnyObject>> {
-            self.ivars().item_state.object_for_type(r#type).map(|v| Id::cast(v))
-        }
+    if let Some(protocol) = Protocol::get("NSFilePromiseProviderDelegate") {
+        decl.add_protocol(protocol);
     }
+    decl.add_method(sel!(dealloc), dealloc as extern "C" fn(&Object, Sel));
 
-    unsafe impl NSFilePromiseProviderDelegate for SNEPasteboardWriter {
-        #[method_id(filePromiseProvider:fileNameForType:)]
-        #[allow(non_snake_case)]
-        unsafe fn filePromiseProvider_fileNameForType(
-            &self,
-            _file_promise_provider: &NSFilePromiseProvider,
-            file_type: &NSString,
-        ) -> Id<NSString> {
-            self.ivars().item_state.file_promise_file_name_for_type(file_type)
-        }
+    // NSPasteboardWriting
+    decl.add_method(
+        sel!(writableTypesForPasteboard:),
+        writable_types_for_pasteboard as extern "C" fn(&Object, Sel, id) -> id,
+    );
+    decl.add_method(
+        sel!(writingOptionsForType:pasteboard:),
+        writing_options_for_type as extern "C" fn(&Object, Sel, id, id) -> NSUInteger,
+    );
+    decl.add_method(
+        sel!(pasteboardPropertyListForType:),
+        pasteboard_property_list_for_type as extern "C" fn(&Object, Sel, id) -> id,
+    );
 
-        #[method(filePromiseProvider:writePromiseToURL:completionHandler:)]
-        #[allow(non_snake_case)]
-        unsafe fn filePromiseProvider_writePromiseToURL_completionHandler(
-            &self,
-            _file_promise_provider: &NSFilePromiseProvider,
-            url: &NSURL,
-            completion_handler: &Block<dyn Fn(*mut NSError)>,
-        ) {
-            let completion_handler =
-                RcBlock::<dyn Fn(*mut NSError)>::copy(completion_handler as *const _ as *mut _).unwrap();
-            let completion_fn = move |error: Option<Id<NSError>>| {
-                let error = match error {
-                    Some(error) => Id::as_ptr(&error),
-                    None => std::ptr::null_mut(),
-                };
-                completion_handler.call((error as *mut _,));
-            };
-            self.ivars().item_state
-                .file_promise_write_to_url(url, Box::new(completion_fn));
-        }
-    }
+    // NSFilePromiseProviderDelegate
+    decl.add_method(
+        sel!(filePromiseProvider:fileNameForType:),
+        file_promise_file_name_for_type as extern "C" fn(&Object, Sel, id, id) -> id,
+    );
+    decl.add_method(
+        sel!(filePromiseProvider:writePromiseToURL:completionHandler:),
+        file_promise_write_to_url as extern "C" fn(&Object, Sel, id, id, id),
+    );
 
-    unsafe impl SNEPasteboardWriter {}
-);
-
-extern_class!(
-    #[derive(PartialEq, Eq, Hash)]
-    pub struct SNEForwardingFilePromiseProvider;
-
-    unsafe impl ClassType for SNEForwardingFilePromiseProvider {
-        type Super = NSFilePromiseProvider;
-        type Mutability = InteriorMutable;
-    }
-);
-
-extern_methods!(
-    unsafe impl SNEForwardingFilePromiseProvider {
-        #[allow(non_snake_case)]
-        #[method(setWritingDelegate:)]
-        pub unsafe fn setWritingDelegate(
-            &self,
-            delgate: Option<&ProtocolObject<dyn NSPasteboardWriting>>,
-        );
-
-        #[method_id(@__retain_semantics Init init)]
-        pub unsafe fn init(this: Allocated<Self>) -> Id<Self>;
-    }
-);
+    decl.register()
+});

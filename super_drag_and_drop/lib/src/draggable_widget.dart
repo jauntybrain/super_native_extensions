@@ -118,10 +118,7 @@ final _keyDrag = _SnapshotKey('Drag');
 
 class DragItemWidgetState extends State<DragItemWidget> {
   Future<_DragImage?> _getSnapshot(Offset location) async {
-    final snapshotter = _snapshotterKey.currentState;
-    if (snapshotter == null || !snapshotter.mounted) {
-      return null;
-    }
+    final snapshotter = _snapshotterKey.currentState!;
 
     raw.TargetedWidgetSnapshot? liftSnapshot;
     if (defaultTargetPlatform == TargetPlatform.iOS ||

@@ -12,11 +12,8 @@ void main() async {
   runApp(const MyApp());
 }
 
-const _notAvailableMessage =
-    'Clipboard is not available on this platform. Use ClipboardEvents API instead.';
-
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  const MyApp({Key? key}) : super(key: key);
 
   // This widget is the root of your application.
   @override
@@ -126,7 +123,7 @@ class HomeLayout extends StatelessWidget {
 }
 
 class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
+  const MyHomePage({Key? key, required this.title}) : super(key: key);
 
   final String title;
 
@@ -145,113 +142,67 @@ class _MyHomePageState extends State<MyHomePage>
     );
   }
 
-  @override
-  void initState() {
-    super.initState();
-    ClipboardEvents.instance?.registerPasteEventListener(_onPasteEvent);
-  }
-
-  @override
-  void dispose() {
-    super.dispose();
-    ClipboardEvents.instance?.unregisterPasteEventListener(_onPasteEvent);
-  }
-
   void copyText() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard != null) {
-      final item = DataWriterItem();
-      item.add(Formats.htmlText('<b>This is a <em>HTML</en> value</b>.'));
-      item.add(Formats.plainText('This is a plaintext value.'));
-      await clipboard.write([item]);
-    } else {
-      showMessage(_notAvailableMessage);
-    }
+    final item = DataWriterItem();
+    item.add(Formats.htmlText('<b>This is a <em>HTML</en> value</b>.'));
+    item.add(Formats.plainText('This is a plaintext value.'));
+    await ClipboardWriter.instance.write([item]);
   }
 
   void copyTextLazy() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard != null) {
-      final item = DataWriterItem();
-      item.add(Formats.htmlText.lazy(() {
-        showMessage('Lazy rich text requested.');
-        return '<b>This is a <em>HTML</en> value</b> generated <u>on demand</u>.';
-      }));
-      item.add(Formats.plainText.lazy(() {
-        showMessage('Lazy plain text requested.');
-        return 'This is a plaintext value generated on demand.';
-      }));
-      await clipboard.write([item]);
-    } else {
-      showMessage(_notAvailableMessage);
-    }
+    final item = DataWriterItem();
+    item.add(Formats.htmlText.lazy(() {
+      showMessage('Lazy rich text requested.');
+      return '<b>This is a <em>HTML</en> value</b> generated <u>on demand</u>.';
+    }));
+    item.add(Formats.plainText.lazy(() {
+      showMessage('Lazy plain text requested.');
+      return 'This is a plaintext value generated on demand.';
+    }));
+    await ClipboardWriter.instance.write([item]);
   }
 
   void copyImage() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard != null) {
-      final image = await createImageData(Colors.red);
-      final item = DataWriterItem(suggestedName: 'RedCircle.png');
-      item.add(Formats.png(image));
-      await clipboard.write([item]);
-    } else {
-      showMessage(_notAvailableMessage);
-    }
+    final image = await createImageData(Colors.red);
+    final item = DataWriterItem(suggestedName: 'RedCircle.png');
+    item.add(Formats.png(image));
+    await ClipboardWriter.instance.write([item]);
   }
 
   void copyImageLazy() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard != null) {
-      final item = DataWriterItem(suggestedName: 'BlueCircle.png');
-      item.add(Formats.png.lazy(() {
-        showMessage('Lazy image requested.');
-        return createImageData(Colors.blue);
-      }));
-      await clipboard.write([item]);
-    } else {
-      showMessage(_notAvailableMessage);
-    }
+    final item = DataWriterItem(suggestedName: 'BlueCircle.png');
+    item.add(Formats.png.lazy(() {
+      showMessage('Lazy image requested.');
+      return createImageData(Colors.blue);
+    }));
+    await ClipboardWriter.instance.write([item]);
   }
 
   void copyCustomData() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard != null) {
-      final item = DataWriterItem();
-      item.add(formatCustom(Uint8List.fromList([1, 2, 3, 4])));
-      await clipboard.write([item]);
-    } else {
-      showMessage(_notAvailableMessage);
-    }
+    final item = DataWriterItem();
+    item.add(formatCustom(Uint8List.fromList([1, 2, 3, 4])));
+    await ClipboardWriter.instance.write([item]);
   }
 
   void copyCustomDataLazy() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard != null) {
-      final item = DataWriterItem();
-      item.add(formatCustom.lazy(() async {
-        showMessage('Lazy custom data requested.');
-        return Uint8List.fromList([1, 2, 3, 4, 5, 6]);
-      }));
-      await clipboard.write([item]);
-    } else {
-      showMessage(_notAvailableMessage);
-    }
+    final item = DataWriterItem();
+    item.add(formatCustom.lazy(() async {
+      showMessage('Lazy custom data requested.');
+      return Uint8List.fromList([1, 2, 3, 4, 5, 6]);
+    }));
+    await ClipboardWriter.instance.write([item]);
   }
 
   void copyUri() async {
-    final clipboard = SystemClipboard.instance;
-    if (clipboard != null) {
-      final item = DataWriterItem();
-      item.add(Formats.uri(NamedUri(
-          Uri.parse('https://github.com/superlistapp/super_native_extensions'),
-          name: 'Super Native Extensions')));
-      await clipboard.write([item]);
-    } else {
-      showMessage(_notAvailableMessage);
-    }
+    final item = DataWriterItem();
+    item.add(Formats.uri(NamedUri(
+        Uri.parse('https://github.com/superlistapp/super_native_extensions'),
+        name: 'Super Native Extensions')));
+    await ClipboardWriter.instance.write([item]);
   }
 
-  void _paste(ClipboardReader reader) async {
+  void _paste() async {
+    final reader = await ClipboardReader.readClipboard();
     final readers = await Future.wait(
       reader.items.map((e) => ReaderInfo.fromReader(e)),
     );
@@ -263,10 +214,6 @@ class _MyHomePageState extends State<MyHomePage>
         contentWidgets = widgets;
       });
     });
-  }
-
-  void _onPasteEvent(ClipboardReadEvent event) async {
-    _paste(await event.getClipboardReader());
   }
 
   var contentWidgets = <Widget>[];
@@ -298,15 +245,7 @@ class _MyHomePageState extends State<MyHomePage>
               child: const Text('Copy Custom - Lazy')),
           OutlinedButton(onPressed: copyUri, child: const Text('Copy URI')),
           OutlinedButton(
-              onPressed: () async {
-                final clipboard = SystemClipboard.instance;
-                if (clipboard != null) {
-                  final reader = await clipboard.read();
-                  _paste(reader);
-                } else {
-                  showMessage(_notAvailableMessage);
-                }
-              },
+              onPressed: _paste,
               style: OutlinedButton.styleFrom(
                 backgroundColor: Colors.blue.shade600,
                 foregroundColor: Colors.white,

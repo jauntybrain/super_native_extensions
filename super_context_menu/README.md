@@ -45,8 +45,6 @@ Basic example:
 
 ```dart
   return ContextMenuWidget(
-    // force to use dark brightness
-    // mobileMenuWidgetBuilder: DefaultMobileMenuWidgetBuilder(brightness: Brightness.dark),
     child: const Item(
     child: Text('Base Context Menu'),
     ),
@@ -70,7 +68,6 @@ Basic example:
 );
 
 ```
-
 ## Running the example project
 
 Example project is available at `super_context_menu/example`.

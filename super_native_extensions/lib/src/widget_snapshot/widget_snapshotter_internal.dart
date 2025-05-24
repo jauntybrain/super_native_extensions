@@ -4,7 +4,6 @@ import 'dart:ui' as ui;
 import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
 
-import '../repaint_boundary.dart';
 import 'widget_snapshot.dart';
 import 'widget_snapshotter.dart';
 
@@ -103,12 +102,6 @@ class WidgetSnapshotterStateImpl extends WidgetSnapshotterState {
     // We have pending snapshot for widget that we haven't built yet
     if (_pendingSnapshots.any((s) => _getRenderObject(s.key) == null)) {
       setState(() {});
-      // TODO(knopp): This is fragile and the underlying reason for the deadlock
-      // needs to be investigates.
-      // On iOS 18 next frame vsync never comes while the run loop is being
-      // polled. This is a ugly workaround to make sure that we do not
-      // deadlock.
-      WidgetsBinding.instance.scheduleWarmUpFrame();
       WidgetsBinding.instance.addPostFrameCallback((timeStamp) {
         _checkSnapshots();
       });
@@ -127,7 +120,7 @@ class WidgetSnapshotterStateImpl extends WidgetSnapshotterState {
           translation = parentData.translation;
         }
       }
-      if (renderObject != null && renderObject.canGetSnapshot) {
+      if (renderObject != null) {
         final snapshot = _getSnapshot(
           context,
           renderObject,
@@ -146,7 +139,7 @@ class WidgetSnapshotterStateImpl extends WidgetSnapshotterState {
     setState(() {});
   }
 
-  RenderBetterRepaintBoundary? _getRenderObject(Object key) {
+  RenderRepaintBoundary? _getRenderObject(Object key) {
     final registeredWidget = _registeredWidgets[key];
     if (registeredWidget == null) {
       return null;
@@ -155,7 +148,7 @@ class WidgetSnapshotterStateImpl extends WidgetSnapshotterState {
         ? _childSnapshotKey.currentContext?.findRenderObject()
         : registeredWidget.repaintBoundaryKey.currentContext
             ?.findRenderObject();
-    return object is RenderBetterRepaintBoundary ? object : null;
+    return object is RenderRepaintBoundary ? object : null;
   }
 
   final _childKey = GlobalKey();
@@ -175,7 +168,7 @@ class WidgetSnapshotterStateImpl extends WidgetSnapshotterState {
           _registeredWidgets.values.any((a) => a.widget == null);
       return _SnapshotLayout(children: [
         if (needRepaintBoundaryForDefaultChild)
-          BetterRepaintBoundary(
+          RepaintBoundary(
             key: _childSnapshotKey,
             child: KeyedSubtree(
               key: _childKey,
@@ -193,7 +186,7 @@ class WidgetSnapshotterStateImpl extends WidgetSnapshotterState {
             debugSnapshotKey: w.key,
             child: ClipRect(
               clipper: const _ZeroClipper(),
-              child: BetterRepaintBoundary(
+              child: RepaintBoundary(
                 key: w.value.repaintBoundaryKey,
                 child: w.value.widget,
               ),
@@ -241,7 +234,7 @@ class _PendingSnapshot {
 
 Future<TargetedWidgetSnapshot> _getSnapshot(
     BuildContext context,
-    RenderBetterRepaintBoundary renderObject,
+    RenderRepaintBoundary renderObject,
     Offset location,
     Offset Function(Rect rect, Offset offset)? translation) async {
   final devicePixelRatio = MediaQuery.of(context).devicePixelRatio;

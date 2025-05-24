@@ -1,6 +1,17 @@
-use objc2_app_kit::NSDragOperation;
+use cocoa::foundation::NSUInteger;
 
 use crate::api_model::DropOperation;
+
+pub type NSDragOperation = NSUInteger;
+
+#[allow(non_upper_case_globals)]
+pub const NSDragOperationNone: NSDragOperation = 0;
+#[allow(non_upper_case_globals)]
+pub const NSDragOperationCopy: NSDragOperation = 1;
+#[allow(non_upper_case_globals)]
+pub const NSDragOperationLink: NSDragOperation = 2;
+#[allow(non_upper_case_globals)]
+pub const NSDragOperationMove: NSDragOperation = 16;
 
 pub trait DropOperationExt {
     fn to_platform(&self) -> NSDragOperation;
@@ -11,34 +22,34 @@ pub trait DropOperationExt {
 impl DropOperationExt for DropOperation {
     fn to_platform(&self) -> NSDragOperation {
         match self {
-            DropOperation::None => NSDragOperation::None,
-            DropOperation::UserCancelled => NSDragOperation::None,
-            DropOperation::Forbidden => NSDragOperation::None,
-            DropOperation::Copy => NSDragOperation::Copy,
-            DropOperation::Link => NSDragOperation::Link,
-            DropOperation::Move => NSDragOperation::Move,
+            DropOperation::None => NSDragOperationNone,
+            DropOperation::UserCancelled => NSDragOperationNone,
+            DropOperation::Forbidden => NSDragOperationNone,
+            DropOperation::Copy => NSDragOperationCopy,
+            DropOperation::Link => NSDragOperationLink,
+            DropOperation::Move => NSDragOperationMove,
         }
     }
 
     fn from_platform(operation: NSDragOperation) -> DropOperation {
         #[allow(non_upper_case_globals)]
         match operation {
-            NSDragOperation::Copy => DropOperation::Copy,
-            NSDragOperation::Move => DropOperation::Move,
-            NSDragOperation::Link => DropOperation::Link,
+            NSDragOperationCopy => DropOperation::Copy,
+            NSDragOperationMove => DropOperation::Move,
+            NSDragOperationLink => DropOperation::Link,
             _ => DropOperation::None,
         }
     }
 
     fn from_platform_mask(operation_mask: NSDragOperation) -> Vec<DropOperation> {
         let mut res = Vec::new();
-        if operation_mask.0 & NSDragOperation::Move.0 == NSDragOperation::Move.0 {
+        if operation_mask & NSDragOperationMove == NSDragOperationMove {
             res.push(DropOperation::Move);
         }
-        if operation_mask.0 & NSDragOperation::Copy.0 == NSDragOperation::Copy.0 {
+        if operation_mask & NSDragOperationCopy == NSDragOperationCopy {
             res.push(DropOperation::Copy);
         }
-        if operation_mask.0 & NSDragOperation::Link.0 == NSDragOperation::Link.0 {
+        if operation_mask & NSDragOperationLink == NSDragOperationLink {
             res.push(DropOperation::Link);
         }
         res
